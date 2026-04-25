@@ -1002,6 +1002,43 @@ def layer16_catalog_gap(co: pd.DataFrame, brand_idx: dict) -> list[Flag]:
 
 
 # ---------------------------------------------------------------------------
+# L17: Blackbelt coverage gap — IMEI is well-formed but not in the BB file
+# ---------------------------------------------------------------------------
+
+def layer17_blackbelt_coverage(co: pd.DataFrame, bb_by_imei: dict) -> list[Flag]:
+    """
+    Advisory only. Flags rows whose IMEI is a Luhn-valid 15-digit IMEI but
+    does not appear in the Blackbelt file's IMEI/IMEI2 columns. Surfaces
+    the coverage gap so the manager can see which inventory has not been
+    tested by Blackbelt and request additional testing.
+
+    Skipped if no Blackbelt data was provided (empty bb_by_imei).
+    Skipped on rows whose IMEI is malformed (those already get a higher-
+    severity L1 flag, so the missing BB record is not the actionable
+    issue).
+    """
+    flags: list[Flag] = []
+    if not bb_by_imei:
+        return flags
+    bb_keys = set(bb_by_imei.keys())
+    for _, r in co.iterrows():
+        if r["imei_shape"] != "imei15":
+            continue
+        if not luhn_valid(r["imei"]):
+            continue
+        if r["imei"] in bb_keys:
+            continue
+        flags.append(mk(
+            r, "L17", "not_in_blackbelt", "LOW", "IMEI Number",
+            r["imei"], "Blackbelt has tested this device",
+            "Valid IMEI is not present in the Blackbelt reference file. "
+            "Blackbelt has not tested this device — consider including this "
+            "model/batch in the next round of Blackbelt testing.",
+        ))
+    return flags
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -1125,6 +1162,10 @@ ISSUE_INFO: dict[str, dict[str, str]] = {
     "brand_model_not_in_bb_catalog": {"problem": "Model not found in Blackbelt's catalog",
                                       "fix": "Ask Blackbelt to add this model to their catalog.",
                                       "expected": "A model with Blackbelt reference data."},
+    # L17
+    "not_in_blackbelt":              {"problem": "Device has not been tested by Blackbelt",
+                                      "fix": "The IMEI is well-formed but no Blackbelt test record exists for this device. Include the unit (or its model/batch) in the next round of Blackbelt testing.",
+                                      "expected": "An IMEI that appears in the Blackbelt reference file."},
 }
 
 # Per-layer metadata for the 'How to Read This Report' guide sheet
@@ -1251,6 +1292,11 @@ def _build_recommendations(by_issue: dict, total_rows: int, flagged_rows: int) -
         n = by_issue["brand_model_not_in_bb_catalog"]
         recs.append(_rec(f"📚 {n} rows describe a model that Blackbelt has no reference data for. Not an error — but Blackbelt's catalogue should be extended so future scans of this model can be validated automatically.", "uncertain"))
 
+    if by_issue.get("not_in_blackbelt", 0):
+        n = by_issue["not_in_blackbelt"]
+        pct = 100 * n / max(total_rows, 1)
+        recs.append(_rec(f"📡 {n} devices ({pct:.0f}% of inventory) have valid IMEIs but no Blackbelt test on file — coverage gap. Consider including these units (or their models/batches) in the next round of Blackbelt testing so future runs can validate them.", "uncertain"))
+
     return recs
 
 
@@ -1270,7 +1316,7 @@ _PRIORITY_ORDER = {label: idx for idx, (label, _) in enumerate(PRIORITY_EXPLAIN)
 # at the manager's request.
 _FLAGGED_COLUMNS = [
     "Deal ID", "IMEI", "Blackbelt", "Stack Bulk", "Location",
-    "Problem", "Field", "Current Value", "What It Should Be",
+    "Problem", "Field", "Current Value",
 ]
 
 _CLEAN_COLUMNS = [
@@ -1299,7 +1345,6 @@ def _friendly_flagged(df: pd.DataFrame,
         "Problem":           df["issue"].map(lambda i: issue_info(i, "problem") or i),
         "Field":             df["field"].astype(str),
         "Current Value":     df["current_value"].astype(str),
-        "What It Should Be": df["issue"].map(lambda i: issue_info(i, "expected")),
     })
     # Sort by severity (CRITICAL first) then row index, so the most important
     # rows are at the top — but those columns are not exported.
@@ -1417,7 +1462,6 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
     write("Problem",           "Plain-English description of what looks wrong.")
     write("Field",             "The column in the source data where the problem sits.")
     write("Current Value",     "The value that was found in that column.")
-    write("What It Should Be", "What a correct entry looks like.")
     write("", "")
 
     write("Check types", "", section=True)
@@ -1451,6 +1495,8 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
           "IMEI = 15 digits, Luhn-valid (mobile phones); IMEISV = 16 digits, IMEI + 2-digit Software Version, no Luhn on the full 16; Manufacturer serial = varies (8–12 typical, alphanumeric for many brands) — common on Wi-Fi tablets.")
     write("Advisory: looks_like_imeisv",
           "When a mobile-phone row has a 16-digit numeric value AND its first 14 digits + a single check digit form a Luhn-valid IMEI, we flag it as Advisory rather than Confirmed Error. This is the IMEISV format — perfectly legitimate, just longer than the canonical 15-digit IMEI. Replace with the 15-digit IMEI for downstream consistency, or keep as IMEISV if your system tracks software version.")
+    write("Advisory: not_in_blackbelt",
+          "Rows where the IMEI is a valid 15-digit Luhn-passing IMEI but does NOT appear in the Blackbelt reference file. This is a coverage gap — Blackbelt has not tested the device. Use this list to plan the next round of Blackbelt testing. Skipped silently if no Blackbelt file is uploaded or it has no IMEIs.")
     write("", "")
 
     # ------------------------------------------------------------------
@@ -1553,6 +1599,9 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     brand_idx = build_brand_idx(catalog)
     print(f"  {len(catalog)} distinct (brand, model) entries")
 
+    # Built early so layer 17 can use it; reused later when writing reports.
+    bb_by_imei = _build_bb_by_imei(bb)
+
     flags: list[Flag] = []
     for layer_fn, name in [
         (layer1_format,                             "L1  FORMAT"),
@@ -1570,7 +1619,8 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
         (layer13_two_storages,                      "L13 TWO-STORAGES"),
         (layer14_grade_damage,                      "L14 GRADE-vs-DAMAGE"),
         (layer15_qr_vs_imei,                        "L15 QR-vs-IMEI"),
-        (lambda df: layer16_catalog_gap(df, brand_idx),   "L16 CATALOG-GAP"),
+        (lambda df: layer16_catalog_gap(df, brand_idx),    "L16 CATALOG-GAP"),
+        (lambda df: layer17_blackbelt_coverage(df, bb_by_imei), "L17 BB-COVERAGE"),
     ]:
         added = layer_fn(co)
         print(f"  {name}: {len(added)} flags")
@@ -1630,8 +1680,8 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
         for _, r in co.iterrows() if int(r["co_row"]) not in flagged_co_rows
     ]
 
-    # Build cross-file lookups for the Blackbelt and Stack Bulk columns.
-    bb_by_imei    = _build_bb_by_imei(bb)
+    # bb_by_imei is built earlier (used by L17). Stack Bulk lookup is built
+    # only here since no layer needs it.
     stack_by_imei = _build_stack_by_imei(stack_path) if stack_path else {}
     print(f"Cross-ref: {len(bb_by_imei)} BB IMEIs, {len(stack_by_imei)} Stack Bulk IMEIs")
 
