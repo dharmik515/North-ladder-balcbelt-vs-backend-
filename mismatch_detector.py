@@ -393,6 +393,40 @@ def layer1_format(co: pd.DataFrame) -> list[Flag]:
                 flags.append(mk(r, "L1", "imei_wrong_length", "HIGH", "IMEI Number",
                                 imei, "15 digits",
                                 f"IMEI has {len(imei)} digits; re-scan."))
+            elif r["imei_shape"] == "imei_like":
+                # 14-digit numerics are just short IMEIs (or MEIDs in disguise).
+                # 16-digit numerics may be IMEISV (IMEI + 2-digit Software
+                # Version). Detect that case so we don't flag a legitimate
+                # IMEISV as a hard error.
+                if len(imei) == 16:
+                    body14 = imei[:14]
+                    matched_imei = next(
+                        (body14 + str(x) for x in range(10) if luhn_valid(body14 + str(x))),
+                        None,
+                    )
+                    if matched_imei:
+                        flags.append(mk(
+                            r, "L1", "looks_like_imeisv", "LOW", "IMEI Number",
+                            imei,
+                            f"15-digit IMEI; IMEISV's first 14 digits give {matched_imei}",
+                            "IMEISV is IMEI + 2-digit Software Version. The IMEI portion is "
+                            "Luhn-valid; replace this 16-digit value with the 15-digit IMEI "
+                            "for consistency, or leave it if your downstream system tracks "
+                            "IMEISV intentionally.",
+                        ))
+                    else:
+                        flags.append(mk(
+                            r, "L1", "imei_wrong_length", "HIGH", "IMEI Number",
+                            imei, "15 digits",
+                            "16 digits but not a valid IMEISV (first 14 digits are not a "
+                            "Luhn-valid IMEI body). Re-scan from the device.",
+                        ))
+                else:  # 14 digits
+                    flags.append(mk(
+                        r, "L1", "imei_wrong_length", "HIGH", "IMEI Number",
+                        imei, "15 digits",
+                        f"IMEI has {len(imei)} digits; re-scan.",
+                    ))
             # serial_like / alnum_other on a mobile row is handled by L2 scan-slot
     return flags
 
@@ -981,12 +1015,15 @@ ISSUE_INFO: dict[str, dict[str, str]] = {
     "imei_missing":      {"problem": "IMEI is missing",
                           "fix": "Scan the phone (dial *#06#) and fill the IMEI column.",
                           "expected": "A 15-digit IMEI from the device."},
-    "imei_luhn_fail":    {"problem": "IMEI fails the Luhn checksum (industry standard digit-verification)",
-                          "fix": "Re-scan the IMEI from the device (dial *#06#). The current value cannot be a real IMEI — see the legend sheet for how the Luhn check works.",
+    "imei_luhn_fail":    {"problem": "Mobile-phone IMEI fails the Luhn checksum (industry-standard digit verification)",
+                          "fix": "Re-scan the IMEI from the device (dial *#06#). The current value cannot be a real IMEI — see the legend sheet for how the Luhn check works. (Rule applies to mobile phones only.)",
                           "expected": "A valid 15-digit IMEI whose check digit (last digit) satisfies the Luhn formula. Legend sheet has a worked example."},
-    "imei_wrong_length": {"problem": "IMEI is not 15 digits",
-                          "fix": "Re-scan the IMEI — wrong length captured.",
-                          "expected": "A 15-digit numeric IMEI."},
+    "imei_wrong_length": {"problem": "Mobile-phone IMEI is not 15 digits",
+                          "fix": "Re-scan the IMEI from the device. (Rule applies to mobile phones only — for laptops, tablets, smartwatches, earphones the column may legitimately hold a manufacturer serial number of any length; see the legend sheet.)",
+                          "expected": "A 15-digit numeric IMEI for mobile phones."},
+    "looks_like_imeisv": {"problem": "16-digit value looks like an IMEISV instead of a 15-digit IMEI",
+                          "fix": "IMEISV is the IMEI plus a 2-digit Software Version code. The first 14 digits of this value form a Luhn-valid IMEI body — drop the trailing 2 digits and replace with the standard 15-digit IMEI, or leave as-is if your downstream system tracks IMEISV intentionally.",
+                          "expected": "A 15-digit IMEI. The first 14 digits of this value are valid; only the trailing 2 digits make it 16 long."},
     # L2 SCAN-SLOT
     "serial_in_imei_slot":  {"problem": "Serial number was entered into the IMEI column",
                              "fix": "Move this value to the Serial column; re-scan IMEI (*#06#).",
@@ -1382,6 +1419,26 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
             continue
         seen.add(key)
         write(info["problem"], info.get("expected", ""))
+    write("", "")
+
+    # ------------------------------------------------------------------
+    # Device identifiers across categories — clarifies that the IMEI rule
+    # only applies to mobile phones and that other categories legitimately
+    # carry non-15-digit identifiers in the same column.
+    # ------------------------------------------------------------------
+    write("About device identifiers across categories", "", section=True)
+    write("Why this matters",
+          "The column labelled 'IMEI' in your inventory does not always hold an actual IMEI. Mobile phones use the 15-digit GSMA IMEI; other product categories use whatever identifier the manufacturer prints on the device. The detector treats the column differently depending on the row's Category, so legitimate non-IMEI identifiers are NOT flagged as length errors.")
+    write("Mobile phone",
+          "Required: 15-digit numeric IMEI that satisfies the Luhn checksum. Anything else — wrong length, non-numeric, or Luhn fail — is flagged as a Confirmed Error. 16-digit values that decompose to a Luhn-valid IMEI body are recognised as IMEISV (see below) and treated as Advisory rather than an error.")
+    write("Smartwatch / Laptop / Tablet (Wi-Fi only) / Earphones",
+          "Most of these devices have no IMEI at all. The column carries the manufacturer's serial number, which varies in length per brand (Garmin watches: ~9 digits; Apple laptops: 10–12 chars; etc.). The detector does not enforce length on these categories.")
+    write("Cellular tablets / cellular smartwatches",
+          "These devices DO have a 15-digit IMEI. If the row's Category is something other than 'mobile phone' but the device is genuinely cellular, the IMEI rules will not be applied — keep that in mind when interpreting Advisory flags.")
+    write("Identifier formats you may see in the column",
+          "IMEI = 15 digits, Luhn-valid (mobile phones); IMEISV = 16 digits, IMEI + 2-digit Software Version, no Luhn on the full 16; MEID = 14 hex chars (older CDMA, mostly retired); Manufacturer serial = varies (8–12 typical, alphanumeric for many brands); MAC address = 12 hex chars (rare for our categories).")
+    write("Advisory: looks_like_imeisv",
+          "When a mobile-phone row has a 16-digit numeric value AND its first 14 digits + a single check digit form a Luhn-valid IMEI, we flag it as Advisory rather than Confirmed Error. This is the IMEISV format — perfectly legitimate, just longer than the canonical 15-digit IMEI. Replace with the 15-digit IMEI for downstream consistency, or keep as IMEISV if your system tracks software version.")
     write("", "")
 
     # ------------------------------------------------------------------
