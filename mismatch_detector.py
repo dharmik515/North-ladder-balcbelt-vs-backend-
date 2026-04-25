@@ -438,13 +438,9 @@ def layer1_format(co: pd.DataFrame) -> list[Flag]:
 def layer2_scan_slot(co: pd.DataFrame) -> list[Flag]:
     flags: list[Flag] = []
     for _, r in co.iterrows():
-        # IMEI column holding a serial on a phone row
-        if r["category"] == "mobile phone" and r["imei_shape"] in ("serial_like", "alnum_other"):
-            flags.append(mk(r, "L2", "serial_in_imei_slot", "HIGH",
-                            "IMEI Number", r["imei"], "15-digit numeric IMEI",
-                            f"Looks like a device serial ('{r['imei']}') scanned into "
-                            f"the IMEI slot. Move this value to Serial/Barcode and "
-                            f"re-scan IMEI."))
+        # NOTE: serial_in_imei_slot was removed per product spec — too many
+        # false positives across categories where the column legitimately
+        # carries a manufacturer serial number.
 
         # Barcode column holding a 15-digit number (IMEI) on a phone row
         if r["category"] == "mobile phone" and r["barcode_shape"] == "imei15":
@@ -621,6 +617,24 @@ def layer5_duplicates(co: pd.DataFrame) -> list[Flag]:
                             "unique (AssetId, IMEI) pair",
                             f"Same AssetId + IMEI pair appears {n} times — "
                             f"this unit was listed more than once."))
+
+    # Same Deal ID with two different IMEIs — one Deal = one device, so two
+    # IMEIs under one Deal ID means at least one of them was scanned wrong.
+    deal_with_imei = co[(co["appraisal"] != "") & (co["imei"] != "")]
+    for deal_id, group in deal_with_imei.groupby("appraisal"):
+        unique_imeis = group["imei"].unique()
+        if len(unique_imeis) > 1:
+            imei_list = list(unique_imeis)[:5]
+            for _, r in group.iterrows():
+                flags.append(mk(
+                    r, "L5", "same_deal_id_multi_imei", "CRITICAL",
+                    "Deal ID / IMEI",
+                    f"Deal '{deal_id}' / IMEI '{r['imei']}'",
+                    "one IMEI per Deal ID",
+                    f"Deal ID '{deal_id}' is associated with {len(unique_imeis)} different "
+                    f"IMEIs ({imei_list}). One Deal corresponds to one device — at least one "
+                    f"of these IMEIs was scanned against the wrong Deal.",
+                ))
     return flags
 
 
@@ -1025,9 +1039,6 @@ ISSUE_INFO: dict[str, dict[str, str]] = {
                           "fix": "IMEISV is the IMEI plus a 2-digit Software Version code. The first 14 digits of this value form a Luhn-valid IMEI body — drop the trailing 2 digits and replace with the standard 15-digit IMEI, or leave as-is if your downstream system tracks IMEISV intentionally.",
                           "expected": "A 15-digit IMEI. The first 14 digits of this value are valid; only the trailing 2 digits make it 16 long."},
     # L2 SCAN-SLOT
-    "serial_in_imei_slot":  {"problem": "Serial number was entered into the IMEI column",
-                             "fix": "Move this value to the Serial column; re-scan IMEI (*#06#).",
-                             "expected": "A 15-digit numeric IMEI."},
     "imei_in_barcode_slot": {"problem": "IMEI was entered into the Barcode column",
                              "fix": "Move this value to IMEI; re-scan the internal barcode.",
                              "expected": "An internal barcode, not an IMEI."},
@@ -1058,6 +1069,9 @@ ISSUE_INFO: dict[str, dict[str, str]] = {
     "duplicate_asset_id_imei_pair":  {"problem": "Same Asset ID + IMEI listed twice",
                                       "fix": "Delete the duplicate listing.",
                                       "expected": "One listing per (Asset ID, IMEI) pair."},
+    "same_deal_id_multi_imei":       {"problem": "One Deal ID is associated with two or more different IMEIs",
+                                      "fix": "A Deal ID identifies a single device transaction, so it must map to exactly one IMEI. Compare the listed IMEIs against the device(s) physically held under this Deal and keep the correct IMEI; the others were scanned against the wrong Deal.",
+                                      "expected": "Exactly one IMEI per Deal ID."},
     # L6
     "possible_imei1_imei2_pair": {"problem": "Same phone listed twice using IMEI1 and IMEI2",
                                   "fix": "Keep one row per physical device.",
@@ -1180,9 +1194,9 @@ def _build_recommendations(by_issue: dict, total_rows: int, flagged_rows: int) -
         n = by_issue["imei_identity_contradiction"]
         recs.append(_rec(f"🚨 {n} rows share an IMEI number with another row that says it belongs to a different device. An IMEI is globally unique — at least one of each pair is a scan error. Treat as top priority.", "verified"))
 
-    if by_issue.get("serial_in_imei_slot", 0) > 10:
-        n = by_issue["serial_in_imei_slot"]
-        recs.append(_rec(f"📱 {n} phone rows have the device's serial number written into the IMEI column by mistake. The IMEI is the 15-digit number you get by dialling *#06# on the phone — not the serial printed on the back.", "verified"))
+    if by_issue.get("same_deal_id_multi_imei", 0):
+        n = by_issue["same_deal_id_multi_imei"]
+        recs.append(_rec(f"🔗 {n} rows share a Deal ID with another row that has a different IMEI. A Deal ID identifies a single device transaction — two IMEIs under one Deal means at least one IMEI was scanned against the wrong Deal. Pull the physical device(s) for that Deal and keep only the correct IMEI.", "verified"))
 
     if by_issue.get("imei_luhn_fail", 0):
         n = by_issue["imei_luhn_fail"]
@@ -1426,17 +1440,15 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
     # only applies to mobile phones and that other categories legitimately
     # carry non-15-digit identifiers in the same column.
     # ------------------------------------------------------------------
-    write("About device identifiers across categories", "", section=True)
-    write("Why this matters",
-          "The column labelled 'IMEI' in your inventory does not always hold an actual IMEI. Mobile phones use the 15-digit GSMA IMEI; other product categories use whatever identifier the manufacturer prints on the device. The detector treats the column differently depending on the row's Category, so legitimate non-IMEI identifiers are NOT flagged as length errors.")
+    write("About device identifiers (mobile phones + tablets)", "", section=True)
+    write("Scope of this audit",
+          "Per product spec, the model audits only Mobile Phone and Tablet rows. Smartwatches, laptops, earphones and rows with empty Category are dropped at load time and do not appear in any output below. If you need them included, ask engineering to widen the category filter.")
     write("Mobile phone",
           "Required: 15-digit numeric IMEI that satisfies the Luhn checksum. Anything else — wrong length, non-numeric, or Luhn fail — is flagged as a Confirmed Error. 16-digit values that decompose to a Luhn-valid IMEI body are recognised as IMEISV (see below) and treated as Advisory rather than an error.")
-    write("Smartwatch / Laptop / Tablet (Wi-Fi only) / Earphones",
-          "Most of these devices have no IMEI at all. The column carries the manufacturer's serial number, which varies in length per brand (Garmin watches: ~9 digits; Apple laptops: 10–12 chars; etc.). The detector does not enforce length on these categories.")
-    write("Cellular tablets / cellular smartwatches",
-          "These devices DO have a 15-digit IMEI. If the row's Category is something other than 'mobile phone' but the device is genuinely cellular, the IMEI rules will not be applied — keep that in mind when interpreting Advisory flags.")
+    write("Tablet",
+          "Cellular tablets carry a 15-digit IMEI (same rule as phones). Wi-Fi-only tablets carry the manufacturer serial number, which varies in length. The detector does not enforce 15-digit length for tablets — Advisory only — so a non-IMEI serial on a Wi-Fi tablet will not be flagged as a hard error.")
     write("Identifier formats you may see in the column",
-          "IMEI = 15 digits, Luhn-valid (mobile phones); IMEISV = 16 digits, IMEI + 2-digit Software Version, no Luhn on the full 16; MEID = 14 hex chars (older CDMA, mostly retired); Manufacturer serial = varies (8–12 typical, alphanumeric for many brands); MAC address = 12 hex chars (rare for our categories).")
+          "IMEI = 15 digits, Luhn-valid (mobile phones); IMEISV = 16 digits, IMEI + 2-digit Software Version, no Luhn on the full 16; Manufacturer serial = varies (8–12 typical, alphanumeric for many brands) — common on Wi-Fi tablets.")
     write("Advisory: looks_like_imeisv",
           "When a mobile-phone row has a 16-digit numeric value AND its first 14 digits + a single check digit form a Luhn-valid IMEI, we flag it as Advisory rather than Confirmed Error. This is the IMEISV format — perfectly legitimate, just longer than the canonical 15-digit IMEI. Replace with the 15-digit IMEI for downstream consistency, or keep as IMEISV if your system tracks software version.")
     write("", "")
@@ -1525,6 +1537,16 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     print("Loading Company…")
     co = load_company(co_path)
     print(f"  {len(co)} rows")
+
+    # Per product spec, the model only audits mobile phones and tablets.
+    # Other categories (smartwatches, laptops, earphones) are dropped
+    # along with rows whose Category is empty.
+    KEPT_CATEGORIES = {"mobile phone", "tablet"}
+    co_full_count = len(co)
+    co = co[co["category"].isin(KEPT_CATEGORIES)].reset_index(drop=True)
+    co["co_row"] = co.index
+    print(f"  filtered to mobile phone + tablet: {len(co)} rows "
+          f"({co_full_count - len(co)} dropped)")
 
     print("Building catalog…")
     catalog = build_catalog(bb)
