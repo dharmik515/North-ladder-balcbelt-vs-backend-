@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NorthLadder - Data-Quality Detection System</title>
+    <link rel="stylesheet" href="/static/style.css?v=5">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <span class="logo-text">NorthLadder</span>
+            </div>
+            <div class="nav-items">
+                <span class="nav-subtitle">Data-Quality Detection Platform</span>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Container -->
+    <div class="container">
+        <!-- Hero Section -->
+        <section id="hero" class="hero-section visible">
+            <div class="hero-content">
+                <h1 class="hero-title">Electronics Inventory Reconciliation</h1>
+                <p class="hero-subtitle">Automatically detect wrong entries — scan errors and inconsistencies — in your inventory, using Blackbelt as truth reference</p>
+                
+                <!-- Upload Area -->
+                <div class="upload-container">
+                    <div class="upload-box" id="uploadBox">
+                        <div class="upload-icon">📁</div>
+                        <h3>Upload Your Files</h3>
+                        <p style="margin-bottom: 15px; color: #888;">Drag and drop files below or use the buttons</p>
+                        <div class="file-requirements">
+                            <div class="requirement">
+                                <span class="check">✓</span>
+                                <span>Blackbelt Excel Report <em style="color:#888">(reference, required)</em></span>
+                            </div>
+                            <div class="requirement">
+                                <span class="check">✓</span>
+                                <span>Master Template <em style="color:#888">(main inventory file, required)</em></span>
+                            </div>
+                            <div class="requirement">
+                                <span class="check">✓</span>
+                                <span>Stack Bulk Upload <em style="color:#888">(optional reference)</em></span>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap; justify-content: center;">
+                            <button type="button" class="btn btn-secondary" id="selectBlackbeltBtn">
+                                📋 Select Blackbelt File
+                            </button>
+                            <button type="button" class="btn btn-secondary" id="selectMasterBtn">
+                                🗂 Select Master Template
+                            </button>
+                            <button type="button" class="btn btn-secondary" id="selectStackBtn">
+                                📦 Select Stack Bulk Upload
+                            </button>
+                        </div>
+                    </div>
+
+                    <form id="uploadForm" class="upload-form">
+                        <input type="file" id="blackbeltFile" accept=".xlsx" hidden>
+                        <input type="file" id="masterFile"    accept=".xlsx" hidden>
+                        <input type="file" id="stackFile"     accept=".xlsx" hidden>
+                    </form>
+                </div>
+
+                <!-- File Selection Status -->
+                <div class="file-status" id="fileStatus" style="display: none;">
+                    <div class="file-item">
+                        <span class="file-name" id="blackbeltName">Blackbelt: Not selected</span>
+                        <span class="file-check" id="blackbeltCheck">○</span>
+                    </div>
+                    <div class="file-item">
+                        <span class="file-name" id="masterName">Master Template: Not selected</span>
+                        <span class="file-check" id="masterCheck">○</span>
+                    </div>
+                    <div class="file-item">
+                        <span class="file-name" id="stackName">Stack Bulk: Not selected (optional)</span>
+                        <span class="file-check" id="stackCheck">○</span>
+                    </div>
+                </div>
+
+                <!-- Upload Button -->
+                <button class="btn btn-primary btn-large" id="uploadBtn" disabled>
+                    <span class="btn-icon">🚀</span>
+                    <span class="btn-text">Start Analysis</span>
+                </button>
+            </div>
+        </section>
+
+        <!-- Processing Section -->
+        <section id="processing" class="processing-section hidden">
+            <div class="processing-card">
+                <div class="processing-header">
+                    <h2>Analyzing Your Data</h2>
+                    <div class="pulse-dot"></div>
+                </div>
+
+                <!-- Progress Bar -->
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar" id="progressBar"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span id="progressLabel">Initializing...</span>
+                        <span id="progressPercent">0%</span>
+                    </div>
+                </div>
+
+                <!-- Processing Steps -->
+                <div class="processing-steps">
+                    <div class="step completed" id="step1">
+                        <span class="step-icon">✓</span>
+                        <span class="step-label">Files Uploaded</span>
+                    </div>
+                    <div class="step active" id="step2">
+                        <span class="step-icon">⚙</span>
+                        <span class="step-label">Processing Records</span>
+                    </div>
+                    <div class="step" id="step3">
+                        <span class="step-icon">📊</span>
+                        <span class="step-label">Generating Reports</span>
+                    </div>
+                    <div class="step" id="step4">
+                        <span class="step-icon">✨</span>
+                        <span class="step-label">Complete</span>
+                    </div>
+                </div>
+
+                <!-- Processing Info -->
+                <div class="processing-info">
+                    <p>Processing your inventory against Blackbelt database...</p>
+                    <p class="processing-eta">Estimated time: <strong id="eta">2-3 minutes</strong></p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Results Section -->
+        <section id="results" class="results-section hidden">
+            <div class="results-header">
+                <div class="header-content">
+                    <h2>Analysis Complete</h2>
+                    <p class="header-timestamp" id="timestamp"></p>
+                </div>
+                <button class="btn btn-secondary" id="newAnalysisBtn">
+                    <span>+ New Analysis</span>
+                </button>
+            </div>
+
+            <!-- Summary Cards -->
+            <div class="summary-grid">
+                <div class="summary-card high-confidence">
+                    <div class="card-icon">🚨</div>
+                    <div class="card-content">
+                        <h3>Confirmed Errors</h3>
+                        <div class="card-stat" id="highCount">0</div>
+                        <p class="card-label">Near-certain scan or data-entry errors — fix immediately</p>
+                    </div>
+                </div>
+
+                <div class="summary-card medium-confidence">
+                    <div class="card-icon">⚠</div>
+                    <div class="card-content">
+                        <h3>Likely Errors</h3>
+                        <div class="card-stat" id="mediumCount">0</div>
+                        <p class="card-label">Probable errors — analyst should verify before fixing</p>
+                    </div>
+                </div>
+
+                <div class="summary-card low-confidence">
+                    <div class="card-icon">🔎</div>
+                    <div class="card-content">
+                        <h3>Advisory Flags</h3>
+                        <div class="card-stat" id="lowCount">0</div>
+                        <p class="card-label">Weak signals — possibly fine, worth a glance</p>
+                    </div>
+                </div>
+
+                <div class="summary-card unmatched">
+                    <div class="card-icon">✅</div>
+                    <div class="card-content">
+                        <h3>Clean Rows</h3>
+                        <div class="card-stat" id="unmatchedCount">0</div>
+                        <p class="card-label">No issues detected — no action required</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- What do these levels mean? -->
+            <details class="levels-explainer" open>
+                <summary class="levels-explainer-summary">
+                    <span class="explainer-icon">💡</span>
+                    <span>What do these levels mean? (click to expand/collapse)</span>
+                </summary>
+                <div class="levels-explainer-body">
+                    <p class="explainer-intro">
+                        Every row in your inventory is audited for scan errors, format issues, and inconsistencies — checked against its own fields, the rest of the batch, and the Blackbelt catalog.
+                        Each row is then placed into one of four buckets by severity:
+                    </p>
+                    <div class="levels-grid">
+                        <div class="level-row level-high">
+                            <div class="level-head">
+                                <span class="level-icon">🚨</span>
+                                <span class="level-title">Confirmed Errors <em>(severity: Most Important)</em></span>
+                            </div>
+                            <ul>
+                                <li><strong>How it was decided:</strong> the row fails a hard rule — e.g. IMEI has wrong length or fails Luhn, a serial number sits in the IMEI column, two rows claim the same IMEI for different devices, or the brand contradicts the model.</li>
+                                <li><strong>Why you can trust it:</strong> these are near-certain scan or data-entry mistakes, not judgment calls.</li>
+                                <li><strong>What to do:</strong> fix at the source. Re-scan the device or correct the field.</li>
+                            </ul>
+                        </div>
+                        <div class="level-row level-medium">
+                            <div class="level-head">
+                                <span class="level-icon">⚠</span>
+                                <span class="level-title">Likely Errors <em>(severity: Important)</em></span>
+                            </div>
+                            <ul>
+                                <li><strong>How it was decided:</strong> the row breaks a strong pattern — e.g. storage or color mentioned in the asset label isn't a real configuration for that model in the Blackbelt catalog, or the TAC (first 8 digits of IMEI) disagrees with the rest of the batch of the same model.</li>
+                                <li><strong>Why it's not "Confirmed":</strong> the rule is strong but not absolute — the catalog could be incomplete, or the batch could be mixed.</li>
+                                <li><strong>What to do:</strong> analyst should skim each one (5-10 seconds per row) and confirm before correcting.</li>
+                            </ul>
+                        </div>
+                        <div class="level-row level-low">
+                            <div class="level-head">
+                                <span class="level-icon">🔎</span>
+                                <span class="level-title">Advisory Flags <em>(severity: Review)</em></span>
+                            </div>
+                            <ul>
+                                <li><strong>How it was decided:</strong> a weak signal — e.g. a possible IMEI1/IMEI2 pair, an unusual but not impossible value, or a field that's blank where most rows have one.</li>
+                                <li><strong>Why it's only advisory:</strong> these often turn out to be fine on inspection, but they're worth a sanity check.</li>
+                                <li><strong>What to do:</strong> spot-check a sample. Do not auto-correct.</li>
+                            </ul>
+                        </div>
+                        <div class="level-row level-none">
+                            <div class="level-head">
+                                <span class="level-icon">✅</span>
+                                <span class="level-title">Clean Rows</span>
+                            </div>
+                            <ul>
+                                <li><strong>How it was decided:</strong> the row passed every detection rule — format checks, cross-field consistency, batch-level patterns, and catalog validation.</li>
+                                <li><strong>Why this is good:</strong> no errors detected in these rows.</li>
+                                <li><strong>What to do:</strong> nothing — these rows are fine as they are.</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </details>
+
+            <!-- Charts Row -->
+            <div class="charts-container">
+                <div class="chart-card">
+                    <h3>Flag Distribution</h3>
+                    <canvas id="distributionChart"></canvas>
+                </div>
+                <div class="chart-card">
+                    <h3>Severity Breakdown</h3>
+                    <canvas id="confidenceChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Recommendations -->
+            <div class="recommendations-section">
+                <h3 class="section-title">📋 Recommended Actions</h3>
+                <div class="recommendations-list" id="recommendationsList">
+                    <!-- Populated dynamically -->
+                </div>
+            </div>
+
+            <!-- Actions -->
+            <div class="actions-section">
+                <h3 class="section-title">📥 Export & Download</h3>
+                <div class="actions-grid">
+                    <a class="btn btn-action" id="downloadHighBtn" href="#" title="Near-certain scan or data-entry errors — fix at the source immediately.">
+                        <span class="action-icon">🚨</span>
+                        <span class="action-title">Confirmed Errors</span>
+                        <span class="action-sub">Near-certain — fix at the source</span>
+                    </a>
+                    <a class="btn btn-action" id="downloadMediumBtn" href="#" title="Probable errors — analyst should verify before fixing.">
+                        <span class="action-icon">⚠</span>
+                        <span class="action-title">Likely Errors</span>
+                        <span class="action-sub">Probable — verify before fixing</span>
+                    </a>
+                    <a class="btn btn-action" id="downloadLowBtn" href="#" title="Weak signals — possibly fine, worth a glance.">
+                        <span class="action-icon">🔎</span>
+                        <span class="action-title">Advisory Flags</span>
+                        <span class="action-sub">Weak signals — spot-check a sample</span>
+                    </a>
+                    <a class="btn btn-action" id="downloadUnmatchedBtn" href="#" title="No issues detected in these rows.">
+                        <span class="action-icon">✅</span>
+                        <span class="action-title">Clean Rows</span>
+                        <span class="action-sub">No issues detected — no action needed</span>
+                    </a>
+                    <a class="btn btn-action primary" id="downloadAllBtn" href="#" title="All reports bundled into a single ZIP file.">
+                        <span class="action-icon">📦</span>
+                        <span class="action-title">Download All (ZIP)</span>
+                        <span class="action-sub">Everything above, bundled</span>
+                    </a>
+                </div>
+            </div>
+
+            <!-- Detailed Insights -->
+            <div class="insights-section">
+                <h3 class="section-title">🔬 Detailed Insights</h3>
+                <div class="insights-grid">
+                    <div class="insight-card">
+                        <h4>Data Quality Assessment</h4>
+                        <p id="dataQuality">Analyzing data quality...</p>
+                    </div>
+                    <div class="insight-card">
+                        <h4>Next Steps</h4>
+                        <ul id="nextSteps">
+                            <li>Fix the confirmed errors first — these are near-certain scan or data-entry mistakes</li>
+                            <li>Have an analyst skim the likely errors before correcting at the source</li>
+                            <li>Treat advisory flags as weak signals; spot-check a sample</li>
+                            <li>Clean rows need no action</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <p>&copy; 2026 NorthLadder. All rights reserved. | Blackbelt Data-Quality Detection v1.0</p>
+    </footer>
+
+    <!-- Loading Modal -->
+    <div class="loading-overlay" id="loadingOverlay" style="display: none;">
+        <div class="loading-spinner">
+            <div class="spinner"></div>
+            <p>Processing your files...</p>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=6"></script>
+</body>
+</html>
