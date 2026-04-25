@@ -981,9 +981,9 @@ ISSUE_INFO: dict[str, dict[str, str]] = {
     "imei_missing":      {"problem": "IMEI is missing",
                           "fix": "Scan the phone (dial *#06#) and fill the IMEI column.",
                           "expected": "A 15-digit IMEI from the device."},
-    "imei_luhn_fail":    {"problem": "IMEI fails the digit-verification check",
-                          "fix": "Re-scan the IMEI — current value looks mis-read.",
-                          "expected": "A valid 15-digit IMEI."},
+    "imei_luhn_fail":    {"problem": "IMEI fails the Luhn checksum (industry standard digit-verification)",
+                          "fix": "Re-scan the IMEI from the device (dial *#06#). The current value cannot be a real IMEI — see the legend sheet for how the Luhn check works.",
+                          "expected": "A valid 15-digit IMEI whose check digit (last digit) satisfies the Luhn formula. Legend sheet has a worked example."},
     "imei_wrong_length": {"problem": "IMEI is not 15 digits",
                           "fix": "Re-scan the IMEI — wrong length captured.",
                           "expected": "A 15-digit numeric IMEI."},
@@ -1382,6 +1382,26 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
             continue
         seen.add(key)
         write(info["problem"], info.get("expected", ""))
+    write("", "")
+
+    # ------------------------------------------------------------------
+    # About the IMEI Luhn check — why we keep this rule, and how it works.
+    # Same explainer the team walked through; lives in the report so anyone
+    # opening a downloaded file can self-serve.
+    # ------------------------------------------------------------------
+    write("About the IMEI Luhn check", "", section=True)
+    write("Why this rule exists",
+          "Every genuine IMEI is required by the GSMA (the global mobile-industry body) to satisfy the Luhn checksum — the same arithmetic check used for credit-card numbers. The standard is in 3GPP TS 23.003 §6.2. Phone manufacturers, carriers, the GSMA IMEI Database, and stolen-phone registries (CEIR, etc.) all enforce it. So if a row in your inventory fails Luhn, the value cannot be a real IMEI — it is mathematically guaranteed to be a scanner mis-read, typo, or fabricated number.")
+    write("What it catches",
+          "Luhn deterministically catches 100% of single-digit mis-reads and the vast majority of adjacent-digit transpositions. Together, those two error types account for ~95% of all real-world data-entry mistakes — which is why the check sits in the Confirmed Errors bucket: it is not a heuristic, it is a hard rule.")
+    write("How the math works",
+          "Take the 15 IMEI digits and process them from right to left, indexing 0…14. For each digit at an odd index, double it; if the doubled value exceeds 9, subtract 9. Leave even-index digits as they are. Sum every contribution. The IMEI is valid if and only if that sum is divisible by 10.")
+    write("Worked example: 359451189789292 (valid)",
+          "Reverse: 2 9 2 9 8 7 9 8 1 1 5 4 9 5 3. Double odd indices and reduce: 2, (9×2=18→9), 2, (9×2=18→9), 8, (7×2=14→5), 9, (8×2=16→7), 1, (1×2=2), 5, (4×2=8), 9, (5×2=10→1), 3. Sum = 2+9+2+9+8+5+9+7+1+2+5+8+9+1+3 = 80. 80 mod 10 = 0  →  VALID.")
+    write("Worked example: 866775601760336 (fails)",
+          "Same procedure produces a sum of 63. 63 mod 10 = 3, not 0  →  FAILS Luhn. The correct check digit for the body 86677560176033 is 3, so the right IMEI is 866775601760333 — the last digit was mis-read as 6 instead of 3.")
+    write("What to do for a failing row",
+          "Treat the IMEI as untrusted. Re-scan the device (dial *#06# on phones; for laptops and other categories, read the IMEI label or use the manufacturer's diagnostics). Replace the value in your source system. Do not list the unit until the IMEI is corrected.")
 
 
 def _write_excel_report(rows: list | pd.DataFrame, out_path: Path, is_flagged: bool,
