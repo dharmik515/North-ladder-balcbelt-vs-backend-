@@ -252,6 +252,16 @@ def _load_company_stackbulk(path: str, sheet: str = "BulkSell") -> pd.DataFrame:
     for p in loc_parts[1:]:
         location_text = location_text.str.cat(p, sep=" / ", na_rep="")
 
+    # VAT can come from either of two columns depending on the export
+    # variant; prefer the appraisal-side value, fall back to the sell-side.
+    vat = df.get("Appraisal VATType")
+    if vat is None or vat.isna().all():
+        vat = df.get("VAT Type", pd.Series([""] * len(df)))
+    vat = vat.map(norm_text).fillna("")
+
+    storage_country = df.get("Storage Member Country", pd.Series([""] * len(df)))
+    storage_country = storage_country.map(norm_text).fillna("")
+
     co = pd.DataFrame({
         "co_row":       df.index,
         "appraisal":    df["Appraisal"].astype(str),
@@ -265,12 +275,34 @@ def _load_company_stackbulk(path: str, sheet: str = "BulkSell") -> pd.DataFrame:
         "asset_label":  df["Asset Label"].map(norm_text),
         "category":     df["Category"].map(norm_text),
         "grade":        df["Latest Assessed Grade"].map(norm_text),
+        "vat_type":     vat,
+        "country":      storage_country,
         "location_text": location_text,
     })
     co["storage_gb"] = co["asset_label"].map(extract_storage_gb)
     co["imei_shape"] = co["imei"].map(imei_shape)
     co["barcode_shape"] = co["barcode"].map(imei_shape)
+    co["deal_date"] = co["appraisal"].map(_parse_deal_date)
     return co
+
+
+def _parse_deal_date(s) -> Optional[str]:
+    """
+    Master Deal IDs (and Stack Appraisals) are formatted like 'AE-DDMMYY-XXXXXX'
+    or 'RENAE-DDMMYY-XXXXXX'. Return ISO date string YYYY-MM-DD, or None.
+    """
+    if not s or (isinstance(s, float) and pd.isna(s)):
+        return None
+    m = re.search(r"(\d{2})(\d{2})(\d{2})-\d+", str(s))
+    if not m:
+        return None
+    dd, mm, yy = m.groups()
+    try:
+        # Two-digit year: assume 20YY (current era).
+        from datetime import date
+        return date(2000 + int(yy), int(mm), int(dd)).isoformat()
+    except ValueError:
+        return None
 
 
 def _load_company_master(path: str, sheet: str = "StockTake Template") -> pd.DataFrame:
@@ -312,11 +344,14 @@ def _load_company_master(path: str, sheet: str = "StockTake Template") -> pd.Dat
         "asset_label":  df["Model"].map(norm_text),
         "category":     df["Category"].map(norm_text),
         "grade":        df["Grade"].map(norm_text),
+        "vat_type":     df.get("VAT Type", pd.Series([""] * len(df))).map(norm_text).fillna(""),
+        "country":      df.get("Country",  pd.Series([""] * len(df))).map(norm_text).fillna(""),
         "location_text": location_text,
     })
     co["storage_gb"] = co["asset_label"].map(extract_storage_gb)
     co["imei_shape"] = co["imei"].map(imei_shape)
     co["barcode_shape"] = co["barcode"].map(imei_shape)
+    co["deal_date"] = co["appraisal"].map(_parse_deal_date)
     return co
 
 
@@ -438,9 +473,16 @@ def layer1_format(co: pd.DataFrame) -> list[Flag]:
 def layer2_scan_slot(co: pd.DataFrame) -> list[Flag]:
     flags: list[Flag] = []
     for _, r in co.iterrows():
-        # NOTE: serial_in_imei_slot was removed per product spec — too many
-        # false positives across categories where the column legitimately
-        # carries a manufacturer serial number.
+        # IMEI column holding an alphanumeric value on a phone or tablet row.
+        # The previous false-positive concern is addressed by the category
+        # filter at run() — laptops/smartwatches/earphones never reach here.
+        if (r["category"] in ("mobile phone", "tablet")
+                and r["imei_shape"] in ("serial_like", "alnum_other")):
+            flags.append(mk(r, "L2", "serial_in_imei_slot", "HIGH",
+                            "IMEI Number", r["imei"], "15-digit numeric IMEI",
+                            f"Looks like a serial number ('{r['imei']}') was scanned "
+                            f"into the IMEI slot. Re-scan the IMEI from the device "
+                            f"(dial *#06# on phones)."))
 
         # Barcode column holding a 15-digit number (IMEI) on a phone row
         if r["category"] == "mobile phone" and r["barcode_shape"] == "imei15":
@@ -1002,6 +1044,268 @@ def layer16_catalog_gap(co: pd.DataFrame, brand_idx: dict) -> list[Flag]:
 
 
 # ---------------------------------------------------------------------------
+# L18: BB ↔ Master field-level reconciliation
+# When the Master row's IMEI matches a BB row, compare field-by-field.
+# BB is treated as the truth — disagreements are flagged HIGH (Confirmed
+# Errors) because BB's data comes from a physical device test, not from
+# manual entry.
+# ---------------------------------------------------------------------------
+
+def _grade_normalize(g: str) -> str:
+    """Normalize grade strings for comparison ('A+', 'as new', 'Grade A.' → 'a')."""
+    g = norm_text(g)
+    g = re.sub(r"^grade\s+", "", g)
+    # Strip trailing punctuation/whitespace and the '+' modifier so 'd2.'
+    # and 'D2' compare equal.
+    g = re.sub(r"[.\s+]+$", "", g).replace("+", "").strip()
+    aliases = {"a": "a", "as new": "a", "as-new": "a", "new": "a",
+               "b": "b", "c": "c", "d": "d", "d1": "d1", "d2": "d2",
+               "e": "e", "f": "f"}
+    return aliases.get(g, g)
+
+
+def layer18_bb_reconciliation(co: pd.DataFrame, bb_records: dict) -> list[Flag]:
+    """
+    Per-row field reconciliation against Blackbelt's recorded test results.
+    Skipped on rows whose IMEI is not in BB (no record to compare against).
+    """
+    flags: list[Flag] = []
+    if not bb_records:
+        return flags
+    for _, r in co.iterrows():
+        rec = bb_records.get(str(r["imei"]))
+        if rec is None:
+            continue
+
+        # Brand
+        bb_brand, m_brand = rec["brand"], r["brand"]
+        if bb_brand and m_brand and bb_brand != m_brand:
+            flags.append(mk(r, "L18", "bb_brand_mismatch", "CRITICAL", "Brand",
+                            f"Master='{m_brand}', Blackbelt='{bb_brand}'",
+                            f"'{bb_brand}' (per Blackbelt test)",
+                            f"Blackbelt physically tested this IMEI as a {bb_brand} "
+                            f"device, but Master records it as {m_brand}. Update "
+                            f"Master.Brand to '{bb_brand}'."))
+
+        # Model — check that BB's model tokens are a subset of Master's label
+        bb_model, m_label = rec["model"], r["asset_label"]
+        if bb_model and m_label:
+            bb_tokens = {t for t in re.split(r"[^a-z0-9]+", bb_model) if len(t) >= 3}
+            m_tokens  = set(re.split(r"[^a-z0-9]+", m_label))
+            if bb_tokens and not bb_tokens.issubset(m_tokens):
+                flags.append(mk(r, "L18", "bb_model_mismatch", "HIGH", "Model",
+                                f"Master='{m_label}', Blackbelt='{bb_model}'",
+                                f"'{bb_model}' (per Blackbelt test)",
+                                f"Blackbelt tested this IMEI as '{bb_model}', but "
+                                f"Master's label doesn't mention it. Update Master."))
+
+        # Storage
+        bb_st, m_st = rec["storage_gb"], r["storage_gb"]
+        if bb_st and m_st and int(bb_st) != int(m_st):
+            flags.append(mk(r, "L18", "bb_storage_mismatch", "HIGH", "Storage",
+                            f"Master={int(m_st)}GB, Blackbelt={int(bb_st)}GB",
+                            f"{int(bb_st)}GB (per Blackbelt test)",
+                            f"Blackbelt's hardware read confirms {int(bb_st)}GB, but "
+                            f"Master records {int(m_st)}GB. Affects price; correct Master."))
+
+        # Grade
+        bb_g, m_g = _grade_normalize(rec["grade"]), _grade_normalize(r["grade"])
+        if bb_g and m_g and bb_g != m_g:
+            flags.append(mk(r, "L18", "bb_grade_mismatch", "HIGH", "Grade",
+                            f"Master='{r['grade']}', Blackbelt='{rec['grade']}'",
+                            f"'{rec['grade']}' (per Blackbelt test machine)",
+                            f"Blackbelt's automated grading disagrees with Master. "
+                            f"BB's grade is the test-machine output; consider it "
+                            f"authoritative. Update Master."))
+
+        # Color (only if BB has it AND Master's label clearly doesn't include it)
+        bb_c = rec["color"].lower() if rec["color"] else ""
+        if bb_c and m_label:
+            color_tokens = set(re.split(r"[^a-z]+", bb_c))
+            label_tokens = set(re.split(r"[^a-z]+", m_label))
+            if color_tokens and not (color_tokens & label_tokens):
+                flags.append(mk(r, "L18", "bb_color_mismatch", "MEDIUM", "Color",
+                                f"Master='{m_label}', Blackbelt color='{rec['color']}'",
+                                f"label mentioning '{rec['color']}'",
+                                f"Blackbelt recorded color '{rec['color']}'; Master's "
+                                f"asset label doesn't mention it. Verify."))
+
+        # Model number (Apple A-codes, Samsung SM-codes — when present in BB)
+        bb_mn = (rec["model_number"] or "").upper().replace(" ", "")
+        if bb_mn and len(bb_mn) >= 4 and m_label:
+            label_codes = re.findall(r"(?:A\d{4,5}|SM-[A-Z0-9]+)", m_label.upper())
+            if label_codes and bb_mn not in label_codes:
+                flags.append(mk(r, "L18", "bb_model_number_mismatch", "MEDIUM",
+                                "Model number",
+                                f"Master mentions {label_codes}, Blackbelt has '{bb_mn}'",
+                                f"label including '{bb_mn}'",
+                                f"Blackbelt recorded model number '{bb_mn}', but "
+                                f"Master's label has {label_codes}. Verify regional variant."))
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# L19: Master ↔ Stack Bulk cross-validation
+# Stack Bulk is the sell-side record of the same physical inventory. When
+# Master and Stack disagree on grade / VAT / country / IMEI presence, at
+# least one side needs correcting.
+# ---------------------------------------------------------------------------
+
+def layer19_master_stack_recon(co: pd.DataFrame,
+                               stack_by_imei: dict,
+                               stack_by_deal: dict) -> list[Flag]:
+    flags: list[Flag] = []
+    if not stack_by_imei and not stack_by_deal:
+        return flags
+    for _, r in co.iterrows():
+        deal = str(r.get("appraisal", "") or "").strip()
+        s_by_imei = stack_by_imei.get(str(r["imei"])) if r["imei"] else None
+        s_by_deal = stack_by_deal.get(deal) if deal else None
+
+        # Grade mismatch (when both sides have a grade and rows can be joined by IMEI)
+        if s_by_imei:
+            mg, sg = _grade_normalize(r["grade"]), _grade_normalize(s_by_imei.get("grade", ""))
+            if mg and sg and mg != sg:
+                flags.append(mk(r, "L19", "master_stack_grade_mismatch", "MEDIUM",
+                                "Grade",
+                                f"Master='{r['grade']}', Stack='{s_by_imei['grade']}'",
+                                "Master and Stack to agree on grade",
+                                f"Master and Stack-Bulk record different grades for the "
+                                f"same IMEI. Affects pricing — reconcile with the grader."))
+
+            # VAT mismatch
+            mv = norm_text(r.get("vat_type", ""))
+            sv = norm_text(s_by_imei.get("vat_type", ""))
+            if mv and sv and mv != sv:
+                flags.append(mk(r, "L19", "master_stack_vat_mismatch", "MEDIUM",
+                                "VAT Type",
+                                f"Master='{r['vat_type']}', Stack='{s_by_imei['vat_type']}'",
+                                "Master and Stack to agree on VAT type",
+                                "Master and Stack disagree on VAT classification — "
+                                "affects pricing & tax. Reconcile."))
+
+            # Country mismatch
+            mc = norm_text(r.get("country", ""))
+            sc = norm_text(s_by_imei.get("country", ""))
+            if mc and sc and mc != sc:
+                flags.append(mk(r, "L19", "master_stack_country_mismatch", "LOW",
+                                "Country",
+                                f"Master='{r['country']}', Stack='{s_by_imei['country']}'",
+                                "Master and Stack to agree on storage country",
+                                "Master and Stack disagree on storage country — "
+                                "either inventory moved or one record is stale."))
+
+        # IMEI not in Stack at all (but Deal is) — Master IMEI may be wrong
+        if r["imei"] and not s_by_imei and s_by_deal:
+            stack_imei = str(s_by_deal.get("imei", "") or "").strip()
+            if stack_imei and stack_imei != str(r["imei"]):
+                flags.append(mk(r, "L19", "master_imei_disagrees_with_stack", "HIGH",
+                                "IMEI Number",
+                                f"Master='{r['imei']}', Stack has '{stack_imei}' for the same Deal",
+                                f"'{stack_imei}' (per Stack Bulk for this Deal)",
+                                f"Master's IMEI doesn't match Stack's IMEI for the "
+                                f"same Deal ID '{deal}'. Stack records '{stack_imei}'; "
+                                f"verify which is correct and update Master."))
+
+        # IMEI in Master but Stack has no record at all (no IMEI, no Deal)
+        if r["imei"] and not s_by_imei and not s_by_deal:
+            flags.append(mk(r, "L19", "master_not_in_stack", "LOW",
+                            "IMEI / Deal ID",
+                            f"IMEI='{r['imei']}', Deal='{deal}'",
+                            "device should appear in Stack Bulk if queued for sale",
+                            "Device exists in Master but isn't in the Stack Bulk file. "
+                            "Either it hasn't been queued for sale yet, or one of the "
+                            "two records is wrong."))
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# L20: Stale inventory — Deal date is older than 12 months
+# ---------------------------------------------------------------------------
+
+def layer20_stale_inventory(co: pd.DataFrame, today_iso: str = None) -> list[Flag]:
+    from datetime import date
+    today = date.fromisoformat(today_iso) if today_iso else date.today()
+    flags: list[Flag] = []
+    for _, r in co.iterrows():
+        d = r.get("deal_date")
+        if not d:
+            continue
+        try:
+            deal_d = date.fromisoformat(d)
+        except (ValueError, TypeError):
+            continue
+        days = (today - deal_d).days
+        if days > 365:
+            months = days // 30
+            flags.append(mk(r, "L20", "stale_inventory", "LOW",
+                            "Deal date",
+                            f"Deal opened {deal_d.isoformat()} ({months} months ago)",
+                            "active inventory normally turns over within 12 months",
+                            f"This unit has been in inventory for ~{months} months. "
+                            f"Review whether to liquidate, return, or keep listing."))
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# L21: BB test-result failures
+# When BB's recorded tests have FAIL outcomes (Battery, Bluetooth, Screen,
+# etc.), surface them so the inventory team knows the device shouldn't be
+# sold as-is.
+# ---------------------------------------------------------------------------
+
+def layer21_bb_test_failures(co: pd.DataFrame, bb_records: dict) -> list[Flag]:
+    flags: list[Flag] = []
+    if not bb_records:
+        return flags
+    for _, r in co.iterrows():
+        rec = bb_records.get(str(r["imei"]))
+        if not rec:
+            continue
+        failed = [name for name, val in rec.get("tests", {}).items()
+                  if val == "FAIL"]
+        if not failed:
+            continue
+        flags.append(mk(r, "L21", "bb_test_failed", "HIGH",
+                        "Blackbelt test results",
+                        f"Failed: {', '.join(failed[:5])}"
+                        + (f" (+{len(failed)-5} more)" if len(failed) > 5 else ""),
+                        "all Blackbelt tests passed",
+                        f"Blackbelt's automated test machine recorded {len(failed)} "
+                        f"failed test(s) for this device. Do not list as fully "
+                        f"functional until repaired/regraded."))
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# L22: BB refurbished-part detection
+# When BB's RP (Replaced Part) columns flag a non-genuine component, surface
+# it. This is a material disclosure item for resale.
+# ---------------------------------------------------------------------------
+
+def layer22_bb_refurbished_parts(co: pd.DataFrame, bb_records: dict) -> list[Flag]:
+    flags: list[Flag] = []
+    if not bb_records:
+        return flags
+    for _, r in co.iterrows():
+        rec = bb_records.get(str(r["imei"]))
+        if not rec:
+            continue
+        parts = rec.get("refurbished", [])
+        if not parts:
+            continue
+        flags.append(mk(r, "L22", "bb_refurbished_parts", "MEDIUM",
+                        "Blackbelt parts check",
+                        f"Non-genuine: {', '.join(parts[:5])}"
+                        + (f" (+{len(parts)-5} more)" if len(parts) > 5 else ""),
+                        "all components genuine",
+                        f"Blackbelt detected {len(parts)} non-genuine/replaced "
+                        f"component(s). Material disclosure for resale; verify "
+                        f"price tier and customer-facing description."))
+    return flags
+
+
+# ---------------------------------------------------------------------------
 # L17: Blackbelt coverage gap — IMEI is well-formed but not in the BB file
 # ---------------------------------------------------------------------------
 
@@ -1166,6 +1470,56 @@ ISSUE_INFO: dict[str, dict[str, str]] = {
     "not_in_blackbelt":              {"problem": "Device has not been tested by Blackbelt",
                                       "fix": "The IMEI is well-formed but no Blackbelt test record exists for this device. Include the unit (or its model/batch) in the next round of Blackbelt testing.",
                                       "expected": "An IMEI that appears in the Blackbelt reference file."},
+    # L18 — BB ↔ Master field reconciliation (BB is treated as truth)
+    "bb_brand_mismatch":             {"problem": "Brand in Master disagrees with Blackbelt's recorded brand",
+                                      "fix": "Blackbelt's hardware test identified a different manufacturer than what Master records. Update Master.Brand to match Blackbelt — the test machine reads from the device firmware.",
+                                      "expected": "Master and Blackbelt to agree on Brand."},
+    "bb_model_mismatch":             {"problem": "Model in Master doesn't match Blackbelt's recorded model",
+                                      "fix": "Blackbelt's recorded model name is not present in Master's asset label. Update Master to match Blackbelt's model.",
+                                      "expected": "Master's label to mention the model Blackbelt recorded."},
+    "bb_storage_mismatch":           {"problem": "Storage size in Master disagrees with Blackbelt's recorded storage",
+                                      "fix": "Blackbelt's hardware read disagrees with Master's storage size. Storage drives price by 10–30%; correct Master to match Blackbelt's value.",
+                                      "expected": "Master and Blackbelt to agree on storage size."},
+    "bb_grade_mismatch":             {"problem": "Grade in Master disagrees with Blackbelt's automated grade",
+                                      "fix": "Blackbelt's grade comes from the test machine and is more rigorous than manual grading. Treat BB's grade as authoritative; update Master.",
+                                      "expected": "Master and Blackbelt to agree on Grade."},
+    "bb_color_mismatch":             {"problem": "Color in Master's label disagrees with Blackbelt's recorded color",
+                                      "fix": "Blackbelt recorded a different colour. Verify the asset label and update Master.",
+                                      "expected": "Master's label to mention Blackbelt's recorded colour."},
+    "bb_model_number_mismatch":      {"problem": "Model number code disagrees between Master's label and Blackbelt",
+                                      "fix": "Master's label has a different manufacturer code than Blackbelt recorded. May indicate a different regional variant — verify.",
+                                      "expected": "Master's label model-number code to match Blackbelt."},
+    # L19 — Master ↔ Stack reconciliation
+    "master_stack_grade_mismatch":   {"problem": "Master and Stack-Bulk record different grades for the same IMEI",
+                                      "fix": "Two separate graders disagree on the device's grade. Affects price; reconcile with the team and use the more rigorous source.",
+                                      "expected": "Master and Stack to agree on Grade."},
+    "master_stack_vat_mismatch":     {"problem": "Master and Stack record different VAT classifications",
+                                      "fix": "VAT type drives tax handling. Reconcile and update the wrong side.",
+                                      "expected": "Master and Stack to agree on VAT Type."},
+    "master_stack_country_mismatch": {"problem": "Master and Stack record different storage countries",
+                                      "fix": "Either inventory moved between locations or one record is stale. Update the lagging record.",
+                                      "expected": "Master and Stack to agree on storage country."},
+    "master_imei_disagrees_with_stack": {"problem": "Master's IMEI doesn't match Stack's IMEI for the same Deal",
+                                      "fix": "The same Deal ID has one IMEI in Master and a different IMEI in Stack. Stack's value is shown — verify which is correct and update Master.",
+                                      "expected": "Master and Stack to record the same IMEI for one Deal."},
+    "master_not_in_stack":           {"problem": "Device exists in Master but no record in Stack Bulk",
+                                      "fix": "Either the device hasn't been queued for sale yet, or one of the records is wrong. Investigate.",
+                                      "expected": "Master devices that should be on sale to also exist in Stack."},
+    # L20 — stale inventory
+    "stale_inventory":               {"problem": "Device has been in inventory for more than 12 months",
+                                      "fix": "Long-held inventory ties up capital. Decide whether to liquidate, return, or continue listing.",
+                                      "expected": "Active inventory typically turns over within 12 months."},
+    # L21 — BB test failures
+    "bb_test_failed":                {"problem": "Blackbelt's test machine recorded one or more failed hardware tests",
+                                      "fix": "The device is not fully functional per Blackbelt's automated test. Do not list as fully working until repaired and re-tested.",
+                                      "expected": "All Blackbelt hardware tests to pass."},
+    # L22 — refurbished parts
+    "bb_refurbished_parts":          {"problem": "Blackbelt detected one or more non-genuine / replaced components",
+                                      "fix": "The device has been previously repaired with non-OEM parts. Material disclosure for resale; adjust price tier and update customer-facing description.",
+                                      "expected": "All components to read as genuine in Blackbelt's parts check."},
+    "serial_in_imei_slot":           {"problem": "Serial number entered into the IMEI column",
+                                      "fix": "An alphanumeric serial number was scanned into the IMEI slot. Re-scan the IMEI from the device (dial *#06# on phones; on tablets check the device label).",
+                                      "expected": "A 15-digit numeric IMEI in the IMEI column."},
 }
 
 # Per-layer metadata for the 'How to Read This Report' guide sheet
@@ -1238,6 +1592,52 @@ def _build_recommendations(by_issue: dict, total_rows: int, flagged_rows: int) -
     if by_issue.get("same_deal_id_multi_imei", 0):
         n = by_issue["same_deal_id_multi_imei"]
         recs.append(_rec(f"🔗 {n} rows share a Deal ID with another row that has a different IMEI. A Deal ID identifies a single device transaction — two IMEIs under one Deal means at least one IMEI was scanned against the wrong Deal. Pull the physical device(s) for that Deal and keep only the correct IMEI.", "verified"))
+
+    # L18 — BB-truth disagreements (highest-value confirmed errors when BB has overlap)
+    bb_brand = by_issue.get("bb_brand_mismatch", 0)
+    bb_model = by_issue.get("bb_model_mismatch", 0)
+    if bb_brand or bb_model:
+        n = bb_brand + bb_model
+        recs.append(_rec(f"🧩 {n} devices have a Brand or Model in Master that disagrees with Blackbelt's hardware-tested values. Blackbelt reads identifiers directly from device firmware; treat its values as the truth and update Master.", "verified"))
+
+    if by_issue.get("bb_storage_mismatch", 0):
+        n = by_issue["bb_storage_mismatch"]
+        recs.append(_rec(f"💾 {n} devices have a different storage size in Master than what Blackbelt physically tested. Storage drives price by 10–30%. Update Master to match BB's tested value.", "verified"))
+
+    if by_issue.get("bb_grade_mismatch", 0):
+        n = by_issue["bb_grade_mismatch"]
+        recs.append(_rec(f"🏷 {n} devices have a Master grade that disagrees with Blackbelt's automated grade. BB's grading is the test-machine output; use it as the source of truth for pricing.", "verified"))
+
+    if by_issue.get("serial_in_imei_slot", 0):
+        n = by_issue["serial_in_imei_slot"]
+        recs.append(_rec(f"📝 {n} rows have an alphanumeric serial number written in the IMEI column. Re-scan the IMEI from the device.", "verified"))
+
+    # L19 — Master ↔ Stack reconciliation
+    if by_issue.get("master_imei_disagrees_with_stack", 0):
+        n = by_issue["master_imei_disagrees_with_stack"]
+        recs.append(_rec(f"🔁 {n} devices have a Master IMEI that disagrees with Stack-Bulk's IMEI for the same Deal. Stack records an alternate IMEI — verify which is correct and update Master.", "verified"))
+
+    if by_issue.get("master_stack_grade_mismatch", 0):
+        n = by_issue["master_stack_grade_mismatch"]
+        recs.append(_rec(f"⚖ {n} devices have a different grade in Master than in Stack-Bulk. Reconcile with the grader and standardise on one source.", "likely"))
+
+    if by_issue.get("master_stack_vat_mismatch", 0):
+        n = by_issue["master_stack_vat_mismatch"]
+        recs.append(_rec(f"💰 {n} devices have a different VAT classification in Master vs Stack. VAT drives tax handling — reconcile.", "likely"))
+
+    # L21/L22 — BB hardware test failures and refurb parts
+    if by_issue.get("bb_test_failed", 0):
+        n = by_issue["bb_test_failed"]
+        recs.append(_rec(f"🚨 {n} devices have failed Blackbelt hardware tests (battery, screen, sensors, etc.). Do not list as fully functional until repaired and re-tested.", "verified"))
+
+    if by_issue.get("bb_refurbished_parts", 0):
+        n = by_issue["bb_refurbished_parts"]
+        recs.append(_rec(f"🔧 {n} devices have non-genuine/replaced components per Blackbelt's parts check. Material disclosure for resale — adjust price tier and customer-facing description.", "likely"))
+
+    # L20 — stale inventory
+    if by_issue.get("stale_inventory", 0):
+        n = by_issue["stale_inventory"]
+        recs.append(_rec(f"📅 {n} devices have been in inventory for more than 12 months. Stale inventory ties up capital — review whether to liquidate, return, or keep listing.", "uncertain"))
 
     if by_issue.get("imei_luhn_fail", 0):
         n = by_issue["imei_luhn_fail"]
@@ -1499,6 +1899,21 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
           "Rows where the IMEI is a valid 15-digit Luhn-passing IMEI but does NOT appear in the Blackbelt reference file. This is a coverage gap — Blackbelt has not tested the device. Use this list to plan the next round of Blackbelt testing. Skipped silently if no Blackbelt file is uploaded or it has no IMEIs.")
     write("", "")
 
+    write("Cross-file reconciliation (L18, L19)", "", section=True)
+    write("Trust hierarchy",
+          "When the same device appears in multiple files, the data sources rank like this for trust: (1) Blackbelt — values come from a physical hardware test machine, treated as truth; (2) Stack Bulk — sell-side record, second-best; (3) Master Template — manual inventory entries, most prone to keying errors. Disagreements are flagged with the higher-trust source's value as the suggested correction.")
+    write("L18 BB ↔ Master",
+          "For each Master row whose IMEI matches a Blackbelt IMEI, compare Brand / Model / Storage / Grade / Color / Model Number. Disagreements become Confirmed Errors with BB's value shown as the correct answer. Fires only on rows where BB has a record — invisible until BB coverage is established.")
+    write("L19 Master ↔ Stack Bulk",
+          "For each Master row whose IMEI matches a Stack Bulk IMEI, cross-check Grade / VAT / Country. When IMEIs don't match but Deal IDs do, surface Stack's IMEI as a likely correction for Master. Fires only when a Stack Bulk file is uploaded.")
+    write("L20 Stale inventory",
+          "Devices whose Deal date (parsed from the Deal ID) is more than 12 months old. Advisory only — flags long-held inventory worth reviewing for liquidation.")
+    write("L21 Blackbelt test failures",
+          "When BB recorded one or more failed hardware tests (Battery, Screen, Bluetooth, etc.), surface the device. Do not list as fully functional until repaired and re-tested.")
+    write("L22 Blackbelt refurbished parts",
+          "When BB's parts check (RP Battery, RP LCD, etc.) flags any component as non-genuine, the device has been previously repaired with non-OEM parts. Material disclosure for resale.")
+    write("", "")
+
     # ------------------------------------------------------------------
     # About the IMEI Luhn check — why we keep this rule, and how it works.
     # Same explainer the team walked through; lives in the report so anyone
@@ -1537,7 +1952,12 @@ def _write_excel_report(rows: list | pd.DataFrame, out_path: Path, is_flagged: b
 
 
 def _build_bb_by_imei(bb: pd.DataFrame) -> dict:
-    """Map IMEI (and IMEI2) -> 'Brand Model' string from the Blackbelt file."""
+    """
+    Map IMEI (and IMEI2) -> 'Brand Model' string from the Blackbelt file.
+    This is the simple display-string lookup used by the report column and
+    by L17. The richer record lookup (with all fields) is built separately
+    by _build_bb_records.
+    """
     out: dict = {}
     for _, r in bb.iterrows():
         label_parts = [str(r.get("brand", "") or "").strip(),
@@ -1552,11 +1972,85 @@ def _build_bb_by_imei(bb: pd.DataFrame) -> dict:
     return out
 
 
+def _build_bb_secondary_lookups(bb_path: str) -> dict:
+    """
+    Build IMEI fallback lookups against Blackbelt's secondary identifier
+    columns (Serial Number, EID, Custom Value1, DeviceId, MLB serial number).
+    Used when the primary IMEI lookup misses — recovers matches when the
+    Master IMEI was actually a serial / EID / etc.
+
+    Returns {key_value -> 'Brand Model'} merged across all fallback columns.
+    """
+    out: dict = {}
+    try:
+        bb_raw = pd.read_excel(bb_path, sheet_name="Sheet1")
+    except Exception:
+        return out
+
+    def _label(r):
+        b = str(r.get("Manufacturer", "") or "").strip().lower()
+        m = str(r.get("Model", "") or "").strip().lower()
+        return f"{b} {m}".strip()
+
+    secondary_cols = ("Serial Number", "EID", "Custom Value1",
+                      "DeviceId", "MLB serial number", "IMEI2")
+    for _, r in bb_raw.iterrows():
+        label = _label(r)
+        if not label:
+            continue
+        for col in secondary_cols:
+            v = r.get(col)
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            k = clean_id(v) or str(v).strip()
+            if k and k not in out:
+                out[k] = label
+    return out
+
+
+def _build_bb_records(bb_path: str) -> dict:
+    """
+    Map IMEI (and IMEI2) -> full record of comparable fields from BB.
+    Used by L18 to compare Master against BB field-by-field.
+
+    Each record carries: brand, model, model_number, storage_gb, color,
+    grade, result, refurbished_parts (list).
+    """
+    out: dict = {}
+    try:
+        bb_raw = pd.read_excel(bb_path, sheet_name="Sheet1")
+    except Exception:
+        return out
+
+    rp_cols = [c for c in bb_raw.columns if c.startswith("RP ") and c.endswith(" OEM Status")]
+    test_cols = ["Result", "Battery Test", "Bluetooth", "WiFi", "Speaker",
+                 "Microphone", "Screen Test", "Pixel Test", "Camera Front Result",
+                 "Camera Rear Result", "Vibration", "GSMA Check"]
+
+    for _, r in bb_raw.iterrows():
+        rec = {
+            "brand":        brand_canonical(r.get("Manufacturer", "")),
+            "model":        norm_text(r.get("Model", "")),
+            "model_number": norm_text(r.get("Model Number", "")),
+            "storage_gb":   extract_storage_gb(r.get("Handset Memory Size", "")),
+            "color":        norm_text(r.get("Device Colour", "")),
+            "grade":        norm_text(r.get("Device Grade", "")),
+            "result":       norm_text(r.get("Result", "")),
+            "tests": {c: str(r.get(c, "") or "").upper() for c in test_cols
+                      if pd.notna(r.get(c))},
+            "refurbished":  [c.replace("RP ", "").replace(" OEM Status", "")
+                             for c in rp_cols
+                             if pd.notna(r.get(c))
+                             and str(r.get(c)).strip().lower() != "genuine"],
+        }
+        for k in (clean_id(r.get("IMEI/MEID")), clean_id(r.get("IMEI2"))):
+            if k and k not in out:
+                out[k] = rec
+    return out
+
+
 def _build_stack_by_imei(stack_path: str) -> dict:
-    """
-    Map IMEI -> Asset Label string from a Stack Bulk Upload file (used as a
-    cross-reference column in the downloaded reports).
-    """
+    """Map IMEI -> Asset Label string. Used by the Stack Bulk report column."""
     if not stack_path:
         return {}
     co_stack = _load_company_stackbulk(stack_path,
@@ -1570,6 +2064,38 @@ def _build_stack_by_imei(stack_path: str) -> dict:
         if label and k not in out:
             out[k] = label
     return out
+
+
+def _build_stack_records(stack_path: str) -> tuple[dict, dict]:
+    """
+    Return (by_imei, by_deal) full Stack-Bulk record lookups for L19 cross-
+    validation. Each record carries: brand, model, asset_label, grade,
+    vat_type, country, imei (so we can suggest a corrected IMEI when Master's
+    is bad).
+    """
+    if not stack_path:
+        return {}, {}
+    co_stack = _load_company_stackbulk(stack_path,
+                                       _detect_company_format(stack_path)[1])
+    by_imei: dict = {}
+    by_deal: dict = {}
+    for _, r in co_stack.iterrows():
+        rec = {
+            "brand":       r.get("brand", ""),
+            "asset_label": r.get("asset_label", ""),
+            "grade":       r.get("grade", ""),
+            "vat_type":    r.get("vat_type", ""),
+            "country":     r.get("country", ""),
+            "imei":        r.get("imei", ""),
+            "imei_shape":  r.get("imei_shape", ""),
+        }
+        imei = str(r.get("imei", "") or "").strip()
+        if imei and imei not in by_imei:
+            by_imei[imei] = rec
+        deal = str(r.get("appraisal", "") or "").strip()
+        if deal and deal not in by_deal:
+            by_deal[deal] = rec
+    return by_imei, by_deal
 
 
 def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
@@ -1599,8 +2125,17 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     brand_idx = build_brand_idx(catalog)
     print(f"  {len(catalog)} distinct (brand, model) entries")
 
-    # Built early so layer 17 can use it; reused later when writing reports.
-    bb_by_imei = _build_bb_by_imei(bb)
+    # Cross-file lookups built once, used by L17/L18/L19/L21/L22 and the
+    # report writer. Multi-key fallback merges BB's primary IMEI lookup with
+    # secondary identifier columns (Serial, EID, Custom Value1, etc.) so a
+    # Master row whose "IMEI" is actually a serial still resolves.
+    bb_by_imei_primary   = _build_bb_by_imei(bb)
+    bb_by_imei_secondary = _build_bb_secondary_lookups(bb_path)
+    bb_by_imei = {**bb_by_imei_secondary, **bb_by_imei_primary}  # primary wins on collision
+    bb_records = _build_bb_records(bb_path)
+    stack_by_imei_label = _build_stack_by_imei(stack_path) if stack_path else {}
+    stack_by_imei_full, stack_by_deal_full = (_build_stack_records(stack_path)
+                                               if stack_path else ({}, {}))
 
     flags: list[Flag] = []
     for layer_fn, name in [
@@ -1621,10 +2156,38 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
         (layer15_qr_vs_imei,                        "L15 QR-vs-IMEI"),
         (lambda df: layer16_catalog_gap(df, brand_idx),    "L16 CATALOG-GAP"),
         (lambda df: layer17_blackbelt_coverage(df, bb_by_imei), "L17 BB-COVERAGE"),
+        (lambda df: layer18_bb_reconciliation(df, bb_records),  "L18 BB-RECONCILE"),
+        (lambda df: layer19_master_stack_recon(df, stack_by_imei_full, stack_by_deal_full),
+                                                                "L19 MASTER-STACK"),
+        (layer20_stale_inventory,                               "L20 STALE-INVENTORY"),
+        (lambda df: layer21_bb_test_failures(df, bb_records),   "L21 BB-TEST-FAIL"),
+        (lambda df: layer22_bb_refurbished_parts(df, bb_records), "L22 BB-REFURB"),
     ]:
         added = layer_fn(co)
         print(f"  {name}: {len(added)} flags")
         flags.extend(added)
+
+    # IMEI-recovery enrichment: when L1 flagged a bad IMEI and Stack Bulk has
+    # a valid IMEI for the same Deal ID, append the suggested correction to
+    # the L1 flag's fix text so the analyst sees the answer inline.
+    if stack_by_deal_full:
+        deal_to_co = {str(r["appraisal"]): r for _, r in co.iterrows()
+                      if r.get("appraisal")}
+        bad_imei_issues = {"imei_missing", "imei_luhn_fail", "imei_wrong_length"}
+        for f in flags:
+            if f.issue not in bad_imei_issues:
+                continue
+            stack_rec = stack_by_deal_full.get(f.appraisal)
+            if not stack_rec:
+                continue
+            sk_imei = str(stack_rec.get("imei", "") or "").strip()
+            sk_shape = stack_rec.get("imei_shape", "")
+            if sk_imei and sk_shape == "imei15" and luhn_valid(sk_imei):
+                f.suggested_fix = (
+                    f.suggested_fix
+                    + f"  📡 Stack Bulk has a valid IMEI '{sk_imei}' for the same "
+                      f"Deal ID — likely the correct value to use."
+                )
 
     # Sort by severity then row
     flags.sort(key=lambda f: (SEVERITY_RANK[f.severity], f.co_row))
@@ -1680,10 +2243,10 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
         for _, r in co.iterrows() if int(r["co_row"]) not in flagged_co_rows
     ]
 
-    # bb_by_imei is built earlier (used by L17). Stack Bulk lookup is built
-    # only here since no layer needs it.
-    stack_by_imei = _build_stack_by_imei(stack_path) if stack_path else {}
-    print(f"Cross-ref: {len(bb_by_imei)} BB IMEIs, {len(stack_by_imei)} Stack Bulk IMEIs")
+    # bb_by_imei + stack_by_imei_label are built earlier (used by L17/L19).
+    # Reused here for the report's Blackbelt and Stack Bulk cross-ref columns.
+    stack_by_imei = stack_by_imei_label
+    print(f"Cross-ref: {len(bb_by_imei)} BB IMEI keys, {len(stack_by_imei)} Stack Bulk IMEIs")
 
     # Write the four CSVs the UI download endpoints look for
     pd.DataFrame(high_rows).to_csv(out_dir / UI_FILE_HIGH, index=False)
