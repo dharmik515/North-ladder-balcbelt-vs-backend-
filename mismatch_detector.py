@@ -1052,13 +1052,17 @@ def layer16_catalog_gap(co: pd.DataFrame, brand_idx: dict) -> list[Flag]:
 # ---------------------------------------------------------------------------
 
 def _grade_normalize(g: str) -> str:
-    """Normalize grade strings for comparison ('A+', 'as new', 'Grade A.' → 'a')."""
+    """Normalize grade strings for comparison.
+    BB emits A / A+ / B / C / D1 / D2 / F. Stack emits 'Grade A',
+    'Grade A-Plus', 'Grade D2.' etc. We strip the 'Grade ' prefix and trailing
+    punctuation, then map A-Plus aliases onto 'a+' so A and A+ stay distinct.
+    """
     g = norm_text(g)
     g = re.sub(r"^grade\s+", "", g)
-    # Strip trailing punctuation/whitespace and the '+' modifier so 'd2.'
-    # and 'D2' compare equal.
-    g = re.sub(r"[.\s+]+$", "", g).replace("+", "").strip()
-    aliases = {"a": "a", "as new": "a", "as-new": "a", "new": "a",
+    g = re.sub(r"[.\s]+$", "", g).strip()  # strip trailing dot/space, KEEP '+'
+    aliases = {"a": "a", "a+": "a+",
+               "a-plus": "a+", "a plus": "a+", "aplus": "a+",
+               "as new": "a", "as-new": "a", "new": "a",
                "b": "b", "c": "c", "d": "d", "d1": "d1", "d2": "d2",
                "e": "e", "f": "f"}
     return aliases.get(g, g)
@@ -1358,6 +1362,7 @@ XLSX_FILE_HIGH      = "verified_matches.xlsx"
 XLSX_FILE_MEDIUM    = "likely_matches.xlsx"
 XLSX_FILE_LOW       = "uncertain_matches.xlsx"
 XLSX_FILE_UNMATCHED = "clean_rows.xlsx"
+XLSX_FILE_GRADES    = "grade_mismatches.xlsx"
 
 
 # ---------------------------------------------------------------------------
@@ -1520,6 +1525,18 @@ ISSUE_INFO: dict[str, dict[str, str]] = {
     "serial_in_imei_slot":           {"problem": "Serial number entered into the IMEI column",
                                       "fix": "An alphanumeric serial number was scanned into the IMEI slot. Re-scan the IMEI from the device (dial *#06# on phones; on tablets check the device label).",
                                       "expected": "A 15-digit numeric IMEI in the IMEI column."},
+}
+
+# Issues that don't indicate a per-row data error — coverage gaps, catalog
+# gaps, format-variant advisories, and operational signals. Rows whose ONLY
+# flags are in this set are still considered "clean" (no real problem) so
+# they populate the All-good download instead of being swept into LOW.
+# The recommendations sheet still surfaces these as informational items.
+ADVISORY_ISSUES: set[str] = {
+    "not_in_blackbelt",              # L17 — BB hasn't tested this device yet
+    "brand_model_not_in_bb_catalog", # L16 — BB has no reference for this model
+    "looks_like_imeisv",             # L1  — legitimate IMEISV (16-digit) format
+    "stale_inventory",               # L20 — operational, not a data error
 }
 
 # Per-layer metadata for the 'How to Read This Report' guide sheet
@@ -1951,6 +1968,115 @@ def _write_excel_report(rows: list | pd.DataFrame, out_path: Path, is_flagged: b
         _write_legend_sheet(legend_ws, is_flagged=is_flagged)
 
 
+# ---------------------------------------------------------------------------
+# Grade-mismatch focused report
+# Surfaces just the bb_grade_mismatch flags as a standalone Excel + summary
+# block, since fixing grade mismatches is the highest-priority backend cleanup.
+# ---------------------------------------------------------------------------
+
+def _build_grade_mismatch_table(flags_df: pd.DataFrame, co: pd.DataFrame,
+                                bb_by_imei: dict) -> pd.DataFrame:
+    """One row per bb_grade_mismatch flag with full backend context."""
+    cols = ["Deal ID", "AssetId", "IMEI", "Brand", "Asset Label",
+            "Backend Grade", "Blackbelt Grade", "Direction", "Suggested Fix"]
+    if not len(flags_df):
+        return pd.DataFrame(columns=cols)
+
+    g = flags_df[flags_df["issue"] == "bb_grade_mismatch"].copy()
+    if not len(g):
+        return pd.DataFrame(columns=cols)
+
+    co_idx = co.set_index("co_row")
+    pat = re.compile(r"Master='([^']*)', Blackbelt='([^']*)'")
+
+    # Severity ranking for "device is worse than recorded" vs "better than recorded"
+    rank = {"a+": 0, "a": 1, "b": 2, "c": 3, "d1": 4, "d2": 5, "f": 6,
+            "e": 6, "d": 5}
+
+    def _direction(sk_raw: str, bb_raw: str) -> str:
+        sk_n = _grade_normalize(sk_raw)
+        bb_n = _grade_normalize(bb_raw)
+        if sk_n in rank and bb_n in rank:
+            if rank[bb_n] > rank[sk_n]:
+                return "Backend optimistic — device is actually worse"
+            if rank[bb_n] < rank[sk_n]:
+                return "Backend pessimistic — device is actually better"
+        return "Different grade"
+
+    rows = []
+    for _, f in g.iterrows():
+        co_row = co_idx.loc[int(f["co_row"])] if int(f["co_row"]) in co_idx.index else None
+        m = pat.search(str(f["current_value"]))
+        sk_grade_raw = m.group(1) if m else ""
+        bb_grade_raw = m.group(2) if m else ""
+        rows.append({
+            "Deal ID":         str(f.get("appraisal", "")),
+            "AssetId":         str(f.get("asset_id", "")),
+            "IMEI":            str(co_row["imei"]) if co_row is not None else "",
+            "Brand":           str(co_row["brand"]) if co_row is not None else "",
+            "Asset Label":     str(co_row["asset_label"]) if co_row is not None else "",
+            "Backend Grade":   sk_grade_raw,
+            "Blackbelt Grade": bb_grade_raw,
+            "Direction":       _direction(sk_grade_raw, bb_grade_raw),
+            "Suggested Fix":   f"Update backend grade to '{bb_grade_raw}' to match Blackbelt's hardware-tested value.",
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _write_grade_mismatch_report(table: pd.DataFrame, out_path: Path) -> None:
+    """Write a focused grade-mismatch Excel with a summary tab + detail tab."""
+    if not len(table):
+        # still write a header-only file so download buttons don't 404
+        with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+            table.to_excel(xw, sheet_name="Grade Mismatches", index=False)
+            _style_data_sheet(xw.sheets["Grade Mismatches"], n_rows=0)
+        return
+
+    # Cross-tab: Backend grade x Blackbelt grade
+    cross = (table.groupby(["Backend Grade", "Blackbelt Grade"])
+                  .size().reset_index(name="Count")
+                  .sort_values("Count", ascending=False))
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        # Detail sheet
+        table.to_excel(xw, sheet_name="Grade Mismatches", index=False)
+        _style_data_sheet(xw.sheets["Grade Mismatches"], n_rows=len(table))
+
+        # Summary cross-tab sheet
+        cross.to_excel(xw, sheet_name="Summary", index=False)
+        _style_data_sheet(xw.sheets["Summary"], n_rows=len(cross))
+
+        # Legend
+        legend = xw.book.create_sheet("How to Read This")
+        legend.column_dimensions["A"].width = 30
+        legend.column_dimensions["B"].width = 90
+        from openpyxl.styles import Font, PatternFill, Alignment
+        wrap = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        section = Font(bold=True, size=12, color="1F2A44")
+        rr = 1
+        def w(a, b, *, sec=False):
+            nonlocal rr
+            legend.cell(row=rr, column=1, value=a).alignment = wrap
+            legend.cell(row=rr, column=2, value=b).alignment = wrap
+            if sec:
+                legend.cell(row=rr, column=1).font = section
+                legend.cell(row=rr, column=2).font = section
+            rr += 1
+        w("About this file", "", sec=True)
+        w("Purpose", "Every row where the backend's recorded grade disagrees with "
+                    "the grade Blackbelt's hardware test machine produced. "
+                    "Treat Blackbelt as authoritative — its grade comes from automated "
+                    "diagnostics, not human entry.")
+        w("Backend Grade", "What your backend (Stack Bulk or Master Template) currently records.")
+        w("Blackbelt Grade", "What Blackbelt's test machine produced for the same IMEI.")
+        w("Direction", "Whether the backend is optimistic (overstating condition) or "
+                       "pessimistic (understating). Optimistic mismatches are revenue-risk "
+                       "(unit listed at higher tier than it should be); pessimistic mismatches "
+                       "are pricing-loss (selling for less than the device is worth).")
+        w("Summary tab", "Cross-tab of every (Backend, Blackbelt) grade pair so you can spot "
+                         "systematic biases (e.g. consistent Stack→D1 vs BB→C drift).")
+
+
 def _build_bb_by_imei(bb: pd.DataFrame) -> dict:
     """
     Map IMEI (and IMEI2) -> 'Brand Model' string from the Blackbelt file.
@@ -2195,10 +2321,15 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     flags_df = pd.DataFrame([asdict(f) for f in flags])
     flags_df.to_csv(out_dir / "flagged.csv", index=False)
 
-    # Per-row worst flag
+    # Per-row worst flag — advisory-only issues are excluded from severity
+    # bucketing so a row whose only flags are coverage/catalog gaps falls
+    # through to the clean bucket. They remain in flags_df / by_issue counts
+    # so the recommendations sheet still surfaces them.
+    real_flags_df = (flags_df[~flags_df["issue"].isin(ADVISORY_ISSUES)]
+                     if len(flags_df) else flags_df)
     worst_df = pd.DataFrame()
-    if len(flags_df):
-        worst_df = (flags_df.assign(_rank=flags_df["severity"].map(SEVERITY_RANK))
+    if len(real_flags_df):
+        worst_df = (real_flags_df.assign(_rank=real_flags_df["severity"].map(SEVERITY_RANK))
                               .sort_values("_rank")
                               .groupby("co_row", as_index=False)
                               .first()
@@ -2233,7 +2364,8 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     high_rows   = by_sev["CRITICAL"] + by_sev["HIGH"]
     medium_rows = by_sev["MEDIUM"]
     low_rows    = by_sev["LOW"]
-    flagged_co_rows = set(int(f.co_row) for f in flags)
+    flagged_co_rows = set(int(f.co_row) for f in flags
+                          if f.issue not in ADVISORY_ISSUES)
     clean_rows = [
         {"co_row": int(r["co_row"]), "asset_id": str(r["asset_id"]),
          "appraisal": str(r["appraisal"]),
@@ -2266,6 +2398,16 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     _write_excel_report(clean_rows,  out_dir / XLSX_FILE_UNMATCHED, is_flagged=False,
                         bb_by_imei=bb_by_imei, stack_by_imei=stack_by_imei)
 
+    # Dedicated grade-mismatch report — surfaces just bb_grade_mismatch flags
+    # in their own file, since fixing grade mismatches is the priority cleanup.
+    grade_table = _build_grade_mismatch_table(flags_df, co, bb_by_imei)
+    _write_grade_mismatch_report(grade_table, out_dir / XLSX_FILE_GRADES)
+    grade_cross = (grade_table.groupby(["Backend Grade", "Blackbelt Grade"])
+                              .size().reset_index(name="count")
+                              .sort_values("count", ascending=False)
+                              .to_dict(orient="records")
+                   if len(grade_table) else [])
+
     # Summary (also fed to the UI as `results`)
     by_severity = dict(Counter(f.severity for f in flags))
     by_layer    = dict(Counter(f.layer for f in flags))
@@ -2294,6 +2436,15 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
         },
         "recommendations": _build_recommendations(by_issue, n_total, n_high + n_medium + n_low),
         "processed_at": datetime.now().isoformat(),
+
+        # Grade-mismatch focused block — surfaced as a first-class result so
+        # the UI can show it as a dedicated card (priority cleanup target).
+        "grade_mismatches": {
+            "count":     len(grade_table),
+            "matrix":    grade_cross,                # list of {Backend Grade, Blackbelt Grade, count}
+            "joinable":  int(sum(1 for _, r in co.iterrows()
+                                 if str(r["imei"]) in bb_records)) if bb_records else 0,
+        },
 
         # Detector-internal fields (useful for debugging / exports)
         "detector": {

@@ -111,7 +111,9 @@ st.divider()
 # Step 1 — Uploads
 # ---------------------------------------------------------------------------
 
-st.markdown("### Step 1 — Upload your three files")
+st.markdown("### Step 1 — Upload your files")
+st.caption("Blackbelt + Stack Bulk are enough to run. Master Template is optional — "
+           "include it for an extra cross-check between Master and Stack.")
 
 up1, up2, up3 = st.columns(3)
 with up1:
@@ -121,26 +123,26 @@ with up1:
         help="The reference file from Blackbelt's device testing.",
     )
 with up2:
-    master_file = st.file_uploader(
-        "Master Template  (required)",
-        type=["xlsx"], key="master",
-        help="Your inventory file — the one we want to clean up.",
+    stack_file = st.file_uploader(
+        "Stack Bulk Upload  (required)",
+        type=["xlsx"], key="stack",
+        help="The backend listing — the file we want to clean up.",
     )
 with up3:
-    stack_file = st.file_uploader(
-        "Stack Bulk Upload  (optional)",
-        type=["xlsx"], key="stack",
-        help="The sell-side listing. Helps catch more errors when included.",
+    master_file = st.file_uploader(
+        "Master Template  (optional)",
+        type=["xlsx"], key="master",
+        help="Optional. When provided, Master is audited and Stack is used as cross-check.",
     )
 
-ready = bb_file is not None and master_file is not None
+ready = bb_file is not None and stack_file is not None
 run_clicked = st.button(
     "🚀 Run Analysis",
     type="primary",
     disabled=not ready,
 )
 if not ready:
-    st.info("Pick the Blackbelt file and the Master Template above, then click **Run Analysis**.")
+    st.info("Pick the Blackbelt file and the Stack Bulk Upload above, then click **Run Analysis**.")
 
 
 # ---------------------------------------------------------------------------
@@ -148,18 +150,31 @@ if not ready:
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def _run_detector_cached(bb_bytes, master_bytes, stack_bytes):
+def _run_detector_cached(bb_bytes, stack_bytes, master_bytes):
+    """Routing rules:
+      - BB + Stack only           -> audit Stack directly (co_path=stack)
+      - BB + Stack + Master       -> audit Master, cross-check via Stack (L19)
+    """
     work = Path(tempfile.mkdtemp(prefix="blackbelt_"))
-    bb_path     = work / "blackbelt.xlsx"; bb_path.write_bytes(bb_bytes)
-    master_path = work / "master.xlsx";    master_path.write_bytes(master_bytes)
-    stack_path = None
-    if stack_bytes:
-        stack_path = work / "stack.xlsx"; stack_path.write_bytes(stack_bytes)
+    bb_path    = work / "blackbelt.xlsx"; bb_path.write_bytes(bb_bytes)
+    stack_path = work / "stack.xlsx";     stack_path.write_bytes(stack_bytes)
+    master_path = None
+    if master_bytes:
+        master_path = work / "master.xlsx"; master_path.write_bytes(master_bytes)
+
     out_dir = work / "out"
-    summary = run_detector(
-        str(bb_path), str(master_path), out_dir,
-        stack_path=str(stack_path) if stack_path else None,
-    )
+    if master_path is not None:
+        # Three-file mode: audit Master, cross-ref via Stack
+        summary = run_detector(
+            str(bb_path), str(master_path), out_dir,
+            stack_path=str(stack_path),
+        )
+    else:
+        # Two-file mode: audit Stack directly, no L19 cross-ref
+        summary = run_detector(
+            str(bb_path), str(stack_path), out_dir,
+            stack_path=None,
+        )
     return summary, str(out_dir)
 
 
@@ -169,8 +184,8 @@ if run_clicked and ready:
         progress.progress(20, text="Reading and normalising data…")
         summary, out_dir = _run_detector_cached(
             bb_file.getvalue(),
-            master_file.getvalue(),
-            stack_file.getvalue() if stack_file else None,
+            stack_file.getvalue(),
+            master_file.getvalue() if master_file else None,
         )
         progress.progress(100, text="Done")
         progress.empty()
@@ -337,15 +352,56 @@ if "summary" in st.session_state:
     )
 
     # --- Top KPI strip ---
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("🚨 Need fixing",        f"{matches['high_confidence']['count']:,}",
+    grade_block = summary.get("grade_mismatches") or {}
+    grade_count = int(grade_block.get("count", 0))
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("🏷 Grade mismatches",    f"{grade_count:,}",
+              help="Backend grade disagrees with Blackbelt's hardware-tested grade. "
+                   "Top-priority backend cleanup — affects pricing.")
+    k2.metric("🚨 Need fixing",        f"{matches['high_confidence']['count']:,}",
               help="Definite errors — fix at the source as soon as possible.")
-    k2.metric("⚠ Worth checking",      f"{matches['medium_confidence']['count']:,}",
+    k3.metric("⚠ Worth checking",      f"{matches['medium_confidence']['count']:,}",
               help="Probable errors — an analyst should verify before fixing.")
-    k3.metric("🔎 Just FYI",            f"{matches['low_confidence']['count']:,}",
+    k4.metric("🔎 Just FYI",            f"{matches['low_confidence']['count']:,}",
               help="Weak signals — usually fine, worth a glance.")
-    k4.metric("✅ All good",             f"{matches['unmatched']['count']:,}",
+    k5.metric("✅ All good",             f"{matches['unmatched']['count']:,}",
               help="No issues detected — no action needed.")
+
+    # --- Grade-mismatch dedicated panel ---
+    if grade_count > 0:
+        st.markdown("#### 🏷 Grade mismatches (backend vs. Blackbelt)")
+        matrix = grade_block.get("matrix") or []
+        if matrix:
+            mat_df = pd.DataFrame(matrix).rename(columns={"count": "Devices"})
+            mat_df = mat_df[["Backend Grade", "Blackbelt Grade", "Devices"]]
+            gc1, gc2 = st.columns([3, 2])
+            with gc1:
+                st.dataframe(mat_df, use_container_width=True, hide_index=True,
+                             height=min(40 + 35 * len(mat_df), 360))
+            with gc2:
+                # Simple stacked bar: backend grade -> distribution of BB grades
+                pivot = mat_df.pivot_table(index="Backend Grade",
+                                           columns="Blackbelt Grade",
+                                           values="Devices", fill_value=0)
+                fig = go.Figure()
+                for bb_grade in pivot.columns:
+                    fig.add_bar(name=f"BB={bb_grade}", x=pivot.index,
+                                y=pivot[bb_grade].values)
+                fig.update_layout(
+                    barmode="stack",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font_color="#e0e0e0",
+                    margin=dict(l=10, r=10, t=20, b=10),
+                    height=320,
+                    legend=dict(orientation="h", y=-0.2),
+                    xaxis=dict(title="Backend grade"),
+                    yaxis=dict(title="Devices", gridcolor="#1a1a2e"),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        st.caption("Blackbelt's grade comes from the automated test machine, so "
+                   "treat it as authoritative. Download the dedicated file below to "
+                   "fix these in the backend.")
 
     # --- Charts row ---
     st.markdown("#### 📊 Overview")
@@ -402,6 +458,7 @@ if "summary" in st.session_state:
     )
 
     download_files = [
+        ("🏷 Grade mismatches", "grade_mismatches.xlsx",   "grade_mismatches.xlsx"),
         ("🚨 Need fixing",     "verified_matches.xlsx",   "issues_to_fix.xlsx"),
         ("⚠ Worth checking",   "likely_matches.xlsx",     "probable_issues.xlsx"),
         ("🔎 Just FYI",         "uncertain_matches.xlsx",  "advisory_flags.xlsx"),
