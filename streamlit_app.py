@@ -209,39 +209,39 @@ ISSUE_FRIENDLY = {
     "serial_in_imei_slot":              "Serial number written into the IMEI column",
     "imei_in_barcode_slot":             "IMEI written into the Barcode column",
     "imei_equals_barcode":              "IMEI and Barcode hold the same value",
-    "category_model_mismatch":          "Category doesn't match the model name",
-    "brand_token_absent":               "Brand isn't mentioned in the model name",
-    "storage_unseen_in_bb":             "Storage size unknown to Blackbelt for this model",
+    "category_model_mismatch":          "Category doesn't match the product",
+    "brand_token_absent":               "Brand and Asset Label disagree",
+    "storage_unseen_in_bb":             "Storage size Blackbelt has never seen for this model",
     "duplicate_imei":                   "Same IMEI on more than one row",
     "duplicate_asset_id_imei_pair":     "Same Asset ID + IMEI listed twice",
     "same_deal_id_multi_imei":          "Same Deal ID has more than one IMEI",
-    "possible_imei1_imei2_pair":        "Same phone listed twice (IMEI1 + IMEI2)",
-    "placeholder_imei":                 "Test/fake IMEI in production data",
-    "brand_invalid_value":              "Brand field has a junk value",
+    "possible_imei1_imei2_pair":        "Same phone listed twice (using both its IMEIs)",
+    "placeholder_imei":                 "Fake/test IMEI in production data",
+    "brand_invalid_value":              "Brand field has junk in it",
     "brand_missing":                    "Brand field is empty",
-    "imei_identity_contradiction":      "Same IMEI claimed by two different devices",
-    "tac_cohort_anomaly":               "IMEI prefix doesn't match the rest of the batch",
-    "model_number_mismatch":            "Model-number code doesn't match the model",
-    "color_not_in_bb_catalog":          "Colour not in Blackbelt's records for this model",
-    "two_storages_in_label":            "Two different storage sizes in the same label",
-    "grade_contradicts_damage":         "Grade is high but label mentions damage",
+    "imei_identity_contradiction":      "Same IMEI claims to be two different phones",
+    "tac_cohort_anomaly":               "IMEI was probably scanned off a different phone",
+    "model_number_mismatch":            "Model code in the label doesn't match the model name",
+    "color_not_in_bb_catalog":          "Colour Blackbelt has never seen for this model",
+    "two_storages_in_label":            "Asset Label has two different storage sizes",
+    "grade_contradicts_damage":         "Grade says good but label mentions damage",
     "qr_code_contradicts_imei":         "QR code holds a different IMEI",
-    "brand_model_not_in_bb_catalog":    "Model not found in Blackbelt's catalog",
-    "not_in_blackbelt":                 "Device hasn't been tested by Blackbelt yet",
-    "bb_brand_mismatch":                "Brand differs from Blackbelt's reading",
-    "bb_model_mismatch":                "Model differs from Blackbelt's reading",
-    "bb_storage_mismatch":              "Storage differs from Blackbelt's reading",
-    "bb_grade_mismatch":                "Grade differs from Blackbelt's grading",
-    "bb_color_mismatch":                "Colour differs from Blackbelt's reading",
-    "bb_model_number_mismatch":         "Model-number differs from Blackbelt's reading",
+    "brand_model_not_in_bb_catalog":    "Model not in Blackbelt's catalogue",
+    "not_in_blackbelt":                 "Device hasn't been Blackbelt-tested yet",
+    "bb_brand_mismatch":                "Backend brand disagrees with Blackbelt",
+    "bb_model_mismatch":                "Backend model disagrees with Blackbelt",
+    "bb_storage_mismatch":              "Backend storage disagrees with Blackbelt",
+    "bb_grade_mismatch":                "Backend grade disagrees with Blackbelt",
+    "bb_color_mismatch":                "Backend colour disagrees with Blackbelt",
+    "bb_model_number_mismatch":         "Backend model code disagrees with Blackbelt",
     "master_stack_grade_mismatch":      "Master and Stack disagree on grade",
     "master_stack_vat_mismatch":        "Master and Stack disagree on VAT",
     "master_stack_country_mismatch":    "Master and Stack disagree on country",
-    "master_imei_disagrees_with_stack": "Master and Stack disagree on IMEI for the same Deal",
+    "master_imei_disagrees_with_stack": "Master and Stack record different IMEIs for the same Deal",
     "master_not_in_stack":              "Device in Master but missing from Stack",
     "stale_inventory":                  "In stock for more than 12 months",
-    "bb_test_failed":                   "Blackbelt recorded a hardware test failure",
-    "bb_refurbished_parts":             "Blackbelt detected non-genuine parts",
+    "bb_test_failed":                   "Blackbelt failed a hardware test on this device",
+    "bb_refurbished_parts":             "Blackbelt detected non-original parts",
     "storage_missing":                  "Storage size missing from the label",
 }
 
@@ -342,7 +342,9 @@ if "summary" in st.session_state:
     summary = st.session_state["summary"]
     out_dir = Path(st.session_state["out_dir"])
     matches = summary["matches"]
-    by_issue = summary.get("detector", {}).get("by_issue", {})
+    categories = summary.get("categories") or {}
+    wm = summary.get("wrong_model_comparison") or {}
+    age_block = summary.get("product_age") or {}
 
     st.divider()
     st.markdown("### Step 2 — What we found")
@@ -351,23 +353,32 @@ if "summary" in st.session_state:
         f"against **{summary['total_blackbelt']:,}** Blackbelt records."
     )
 
-    # --- Top KPI strip ---
+    # --- Five category KPI cards (the only checks visible per current scope) ---
+    cat_keys = ["brand_mismatch", "model_mismatch", "storage_mismatch",
+                "grade_mismatch", "not_in_blackbelt"]
+    cat_icons = {"brand_mismatch": "🏭", "model_mismatch": "📱",
+                 "storage_mismatch": "💾", "grade_mismatch": "🏷",
+                 "not_in_blackbelt": "📡"}
+    cat_help = {
+        "brand_mismatch":   "Backend brand doesn't match Blackbelt's reading.",
+        "model_mismatch":   "Backend asset/model name doesn't match Blackbelt's reading.",
+        "storage_mismatch": "Backend storage size disagrees with Blackbelt's reading.",
+        "grade_mismatch":   "Backend grade disagrees with Blackbelt's automated grading.",
+        "not_in_blackbelt": "IMEI looks valid but doesn't appear in the Blackbelt file.",
+    }
+    kcols = st.columns(len(cat_keys) + 1)
+    for key, col in zip(cat_keys, kcols[:-1]):
+        meta = categories.get(key) or {}
+        col.metric(f"{cat_icons[key]} {meta.get('label', key)}",
+                   f"{int(meta.get('count', 0)):,}",
+                   help=cat_help[key])
+    kcols[-1].metric("✅ All good",
+                     f"{matches['unmatched']['count']:,}",
+                     help="No issues in any of the five tracked categories.")
+
+    # --- Grade-mismatch dedicated panel (kept — it's the priority cleanup) ---
     grade_block = summary.get("grade_mismatches") or {}
     grade_count = int(grade_block.get("count", 0))
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("🏷 Grade mismatches",    f"{grade_count:,}",
-              help="Backend grade disagrees with Blackbelt's hardware-tested grade. "
-                   "Top-priority backend cleanup — affects pricing.")
-    k2.metric("🚨 Need fixing",        f"{matches['high_confidence']['count']:,}",
-              help="Definite errors — fix at the source as soon as possible.")
-    k3.metric("⚠ Worth checking",      f"{matches['medium_confidence']['count']:,}",
-              help="Probable errors — an analyst should verify before fixing.")
-    k4.metric("🔎 Just FYI",            f"{matches['low_confidence']['count']:,}",
-              help="Weak signals — usually fine, worth a glance.")
-    k5.metric("✅ All good",             f"{matches['unmatched']['count']:,}",
-              help="No issues detected — no action needed.")
-
-    # --- Grade-mismatch dedicated panel ---
     if grade_count > 0:
         st.markdown("#### 🏷 Grade mismatches (backend vs. Blackbelt)")
         matrix = grade_block.get("matrix") or []
@@ -379,7 +390,6 @@ if "summary" in st.session_state:
                 st.dataframe(mat_df, use_container_width=True, hide_index=True,
                              height=min(40 + 35 * len(mat_df), 360))
             with gc2:
-                # Simple stacked bar: backend grade -> distribution of BB grades
                 pivot = mat_df.pivot_table(index="Backend Grade",
                                            columns="Blackbelt Grade",
                                            values="Devices", fill_value=0)
@@ -403,82 +413,117 @@ if "summary" in st.session_state:
                    "treat it as authoritative. Download the dedicated file below to "
                    "fix these in the backend.")
 
-    # --- Charts row ---
-    st.markdown("#### 📊 Overview")
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        donut, flagged_pct = severity_donut(matches)
-        st.plotly_chart(donut, use_container_width=True)
-    with c2:
-        st.plotly_chart(health_gauge(matches), use_container_width=True)
-        st.caption(
-            f"**{flagged_pct:.1f}%** of devices have at least one issue. "
-            f"Higher scores mean cleaner data."
+    # --- Wrong Model comparison: stack-tagged vs auto-flagged ---
+    st.markdown("#### 🆚 Wrong-model coverage")
+    wm_stack = int(wm.get("stack_tagged_count", 0))
+    wm_auto  = int(wm.get("model_flagged_count", 0))
+    wmc1, wmc2 = st.columns([3, 2])
+    with wmc1:
+        wm_fig = go.Figure(go.Bar(
+            x=["Already tagged in Stack", "Newly flagged by model"],
+            y=[wm_stack, wm_auto],
+            text=[f"{wm_stack:,}", f"{wm_auto:,}"],
+            textposition="outside",
+            marker=dict(color=["#a0a0a0", "#ff6b6b"]),
+            hovertemplate="<b>%{x}</b><br>%{y:,} devices<extra></extra>",
+        ))
+        wm_fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#e0e0e0",
+            margin=dict(l=10, r=10, t=20, b=10),
+            height=280,
+            yaxis=dict(title="Devices", gridcolor="#1a1a2e"),
         )
+        st.plotly_chart(wm_fig, use_container_width=True)
+    with wmc2:
+        st.metric("Stack-tagged 'Wrong Model'", f"{wm_stack:,}",
+                  help="Rows your team had already manually marked as wrong model "
+                       "in Stack — these are skipped from auto-flagging.")
+        st.metric("Auto-flagged Model mismatch", f"{wm_auto:,}",
+                  help="New model mismatches the detector found beyond the team's "
+                       "manual list.")
+        if wm_stack + wm_auto > 0:
+            new_pct = 100 * wm_auto / max(wm_stack + wm_auto, 1)
+            st.caption(f"The detector found **{new_pct:.0f}%** more wrong-model "
+                       f"rows than the team had pre-tagged.")
 
-    # --- Top issues ---
-    if by_issue:
-        st.markdown("#### 🔬 The most common problems we found")
-        top_chart = top_issues_bar(by_issue, n=10)
-        if top_chart:
-            st.plotly_chart(top_chart, use_container_width=True)
-
-    # --- Recommendations ---
-    recs = summary.get("recommendations", [])
-    if recs:
-        st.markdown("#### 📋 What to do next")
-        for rec in recs:
-            text   = rec["text"] if isinstance(rec, dict) else str(rec)
-            bucket = rec.get("bucket", "summary") if isinstance(rec, dict) else "summary"
-            if bucket == "verified":
-                st.error(text, icon="🚨")
-            elif bucket == "likely":
-                st.warning(text, icon="⚠")
-            elif bucket == "uncertain":
-                st.info(text, icon="🔎")
-            else:
-                st.success(text, icon="📊")
-
-    # --- Optional drill-down ---
-    if by_issue:
-        with st.expander("🧮 See every check (full breakdown)"):
-            full_df = pd.DataFrame(
-                [(ISSUE_FRIENDLY.get(k, k.replace("_", " ").title()), v)
-                 for k, v in sorted(by_issue.items(), key=lambda x: -x[1])],
-                columns=["Issue", "Rows flagged"],
+    # --- Product Age section ---
+    if age_block.get("total_with_date", 0) > 0:
+        st.markdown("#### 📅 Product age")
+        st.caption("How long ago each device was traded in. Pick a granularity to "
+                   "see the inventory profile by that interval.")
+        age_choice = st.radio(
+            "Bucket size",
+            options=["Monthly", "Quarterly", "Semi-annual", "Annual"],
+            horizontal=True, key="age_choice",
+        )
+        bucket_key = {
+            "Monthly": "monthly", "Quarterly": "quarterly",
+            "Semi-annual": "semi_annual", "Annual": "annual",
+        }[age_choice]
+        rows = age_block.get(bucket_key) or []
+        if rows:
+            adf = pd.DataFrame(rows)
+            adf = adf.sort_values("bucket")
+            age_fig = go.Figure(go.Bar(
+                x=adf["bucket"].tolist(),
+                y=adf["count"].tolist(),
+                text=adf["count"].tolist(),
+                textposition="outside",
+                marker=dict(color="#00d4ff"),
+                hovertemplate="<b>%{x}</b><br>%{y:,} devices<extra></extra>",
+            ))
+            age_fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#e0e0e0",
+                margin=dict(l=10, r=10, t=20, b=10),
+                height=320,
+                xaxis=dict(title=age_choice + " bucket"),
+                yaxis=dict(title="Devices", gridcolor="#1a1a2e"),
             )
-            st.dataframe(full_df, use_container_width=True, hide_index=True)
+            st.plotly_chart(age_fig, use_container_width=True)
+        else:
+            st.info("No trade-in dates could be parsed from the Deal IDs.")
 
     # --- Downloads ---
     st.divider()
-    st.markdown("### Step 3 — Download the corrected lists")
+    st.markdown("### Step 3 — Download by category")
     st.caption(
-        "Each file has the same columns: Deal ID, IMEI, what Blackbelt says, "
-        "what Stack Bulk says, location, and the specific problem."
+        "One Excel per category. Each file has Deal ID, IMEI, Blackbelt, "
+        "Stack Bulk, Location, Stack ID, VAT Type, Problem, Field, Current Value."
     )
 
     download_files = [
-        ("🏷 Grade mismatches", "grade_mismatches.xlsx",   "grade_mismatches.xlsx"),
-        ("🚨 Need fixing",     "verified_matches.xlsx",   "issues_to_fix.xlsx"),
-        ("⚠ Worth checking",   "likely_matches.xlsx",     "probable_issues.xlsx"),
-        ("🔎 Just FYI",         "uncertain_matches.xlsx",  "advisory_flags.xlsx"),
-        ("✅ All good",          "clean_rows.xlsx",         "clean_rows.xlsx"),
+        ("🏭 Brand mismatch",   "category_brand_mismatch.xlsx",    "brand_mismatch.xlsx"),
+        ("📱 Model mismatch",    "category_model_mismatch.xlsx",    "model_mismatch.xlsx"),
+        ("💾 Storage mismatch",  "category_storage_mismatch.xlsx",  "storage_mismatch.xlsx"),
+        ("🏷 Grade mismatch",    "category_grade_mismatch.xlsx",    "grade_mismatch.xlsx"),
+        ("📡 Not in Blackbelt", "category_not_in_blackbelt.xlsx",  "not_in_blackbelt.xlsx"),
+        ("📅 Product age",       "product_age.xlsx",                "product_age.xlsx"),
+        ("✅ All good",           "clean_rows.xlsx",                 "clean_rows.xlsx"),
     ]
-    cols = st.columns(len(download_files) + 1)
-    for (label, src_name, archive_name), col in zip(download_files, cols[:-1]):
-        path = out_dir / src_name
-        if path.exists():
-            col.download_button(
-                label,
-                data=path.read_bytes(),
-                file_name=archive_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=f"dl_{src_name}",
-            )
-        else:
-            col.button(label, disabled=True, use_container_width=True,
-                       key=f"dl_disabled_{src_name}")
+    # Render in two rows so the buttons don't get squashed: the 5 categories
+    # in the first row, the operational files (Product Age / Clean / ZIP) in the second.
+    def _render_dl_row(items):
+        cols = st.columns(len(items))
+        for (label, src_name, archive_name), col in zip(items, cols):
+            path = out_dir / src_name
+            if path.exists():
+                col.download_button(
+                    label,
+                    data=path.read_bytes(),
+                    file_name=archive_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"dl_{src_name}",
+                )
+            else:
+                col.button(label, disabled=True, use_container_width=True,
+                           key=f"dl_disabled_{src_name}")
+    _render_dl_row(download_files[:5])
+    _render_dl_row(download_files[5:])
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -489,7 +534,7 @@ if "summary" in st.session_state:
         sp = out_dir / "summary.json"
         if sp.exists():
             zf.write(sp, "summary.json")
-    cols[-1].download_button(
+    st.download_button(
         "📦 All files (ZIP)",
         data=zip_buf.getvalue(),
         file_name="northladder_quality_check.zip",

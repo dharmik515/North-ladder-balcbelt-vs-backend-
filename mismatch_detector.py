@@ -262,6 +262,10 @@ def _load_company_stackbulk(path: str, sheet: str = "BulkSell") -> pd.DataFrame:
     storage_country = df.get("Storage Member Country", pd.Series([""] * len(df)))
     storage_country = storage_country.map(norm_text).fillna("")
 
+    # Stack ID identifies the warehouse stack + dealer holding the unit.
+    stack_id = df.get("Existing stack Id & Dealer", pd.Series([""] * len(df)))
+    stack_id = stack_id.astype(str).where(stack_id.notna(), "").str.strip()
+
     co = pd.DataFrame({
         "co_row":       df.index,
         "appraisal":    df["Appraisal"].astype(str),
@@ -278,11 +282,16 @@ def _load_company_stackbulk(path: str, sheet: str = "BulkSell") -> pd.DataFrame:
         "vat_type":     vat,
         "country":      storage_country,
         "location_text": location_text,
+        "stack_id":     stack_id,
     })
     co["storage_gb"] = co["asset_label"].map(extract_storage_gb)
     co["imei_shape"] = co["imei"].map(imei_shape)
     co["barcode_shape"] = co["barcode"].map(imei_shape)
     co["deal_date"] = co["appraisal"].map(_parse_deal_date)
+    # Stack rows whose Stack ID contains 'Wrong Model' have already been
+    # manually tagged by the team. Skip flagging on them; they're tracked
+    # separately for the Stack-tagged vs Auto-flagged comparison visual.
+    co["is_wrong_model"] = co["stack_id"].str.lower().str.contains("wrong model", na=False)
     return co
 
 
@@ -347,11 +356,15 @@ def _load_company_master(path: str, sheet: str = "StockTake Template") -> pd.Dat
         "vat_type":     df.get("VAT Type", pd.Series([""] * len(df))).map(norm_text).fillna(""),
         "country":      df.get("Country",  pd.Series([""] * len(df))).map(norm_text).fillna(""),
         "location_text": location_text,
+        # Master Template doesn't carry an "Existing stack Id" — leave blank.
+        "stack_id":     pd.Series([""] * len(df)),
     })
     co["storage_gb"] = co["asset_label"].map(extract_storage_gb)
     co["imei_shape"] = co["imei"].map(imei_shape)
     co["barcode_shape"] = co["barcode"].map(imei_shape)
     co["deal_date"] = co["appraisal"].map(_parse_deal_date)
+    # Master Template has no Stack ID, so no rows are pre-tagged Wrong Model.
+    co["is_wrong_model"] = False
     return co
 
 
@@ -547,12 +560,10 @@ def layer3_intra_row(co: pd.DataFrame) -> list[Flag]:
                                         f"→ category should be {sorted(valid_cats)}."))
                     break
 
-        # 3c. Storage missing from label for a device type that always has storage
-        if cat in ("mobile phone", "tablet", "laptop") and r["storage_gb"] is None and label:
-            flags.append(mk(r, "L3", "storage_missing", "MEDIUM",
-                            "Asset Label", label, "label including e.g. '128GB'",
-                            "Storage capacity not found in Asset Label — either "
-                            "template not filled or wrong label."))
+        # Note: a previous "storage missing from label" check used to fire here.
+        # Removed — backend silence on a feature is incomplete data, not a
+        # mismatch. Storage is only flagged now when both sides have a value
+        # AND they disagree (L4 storage_unseen_in_bb / L18 bb_storage_mismatch).
     return flags
 
 
@@ -1122,17 +1133,22 @@ def layer18_bb_reconciliation(co: pd.DataFrame, bb_records: dict) -> list[Flag]:
                             f"BB's grade is the test-machine output; consider it "
                             f"authoritative. Update Master."))
 
-        # Color (only if BB has it AND Master's label clearly doesn't include it)
+        # Color: only flag when BOTH sides specify a colour AND they disagree.
+        # Backend labels often omit colour entirely — that's missing data, not a
+        # mismatch. We require the label to mention a recognised colour token
+        # before comparing, so silent labels stop firing this flag.
         bb_c = rec["color"].lower() if rec["color"] else ""
         if bb_c and m_label:
-            color_tokens = set(re.split(r"[^a-z]+", bb_c))
-            label_tokens = set(re.split(r"[^a-z]+", m_label))
-            if color_tokens and not (color_tokens & label_tokens):
+            bb_color_tokens    = set(re.split(r"[^a-z]+", bb_c)) & KNOWN_COLORS
+            label_color_tokens = set(re.split(r"[^a-z]+", m_label)) & KNOWN_COLORS
+            if (bb_color_tokens and label_color_tokens
+                    and not (bb_color_tokens & label_color_tokens)):
                 flags.append(mk(r, "L18", "bb_color_mismatch", "MEDIUM", "Color",
                                 f"Master='{m_label}', Blackbelt color='{rec['color']}'",
-                                f"label mentioning '{rec['color']}'",
-                                f"Blackbelt recorded color '{rec['color']}'; Master's "
-                                f"asset label doesn't mention it. Verify."))
+                                f"label colour matching Blackbelt's '{rec['color']}'",
+                                f"Backend label and Blackbelt both specify a colour, but "
+                                f"they disagree (label has {sorted(label_color_tokens)}, "
+                                f"Blackbelt recorded '{rec['color']}'). Verify which is correct."))
 
         # Model number (Apple A-codes, Samsung SM-codes — when present in BB)
         bb_mn = (rec["model_number"] or "").upper().replace(" ", "")
@@ -1475,27 +1491,27 @@ ISSUE_INFO: dict[str, dict[str, str]] = {
     "not_in_blackbelt":              {"problem": "Device has not been tested by Blackbelt",
                                       "fix": "The IMEI is well-formed but no Blackbelt test record exists for this device. Include the unit (or its model/batch) in the next round of Blackbelt testing.",
                                       "expected": "An IMEI that appears in the Blackbelt reference file."},
-    # L18 — BB ↔ Master field reconciliation (BB is treated as truth)
-    "bb_brand_mismatch":             {"problem": "Brand in Master disagrees with Blackbelt's recorded brand",
-                                      "fix": "Blackbelt's hardware test identified a different manufacturer than what Master records. Update Master.Brand to match Blackbelt — the test machine reads from the device firmware.",
-                                      "expected": "Master and Blackbelt to agree on Brand."},
-    "bb_model_mismatch":             {"problem": "Model in Master doesn't match Blackbelt's recorded model",
-                                      "fix": "Blackbelt's recorded model name is not present in Master's asset label. Update Master to match Blackbelt's model.",
-                                      "expected": "Master's label to mention the model Blackbelt recorded."},
-    "bb_storage_mismatch":           {"problem": "Storage size in Master disagrees with Blackbelt's recorded storage",
-                                      "fix": "Blackbelt's hardware read disagrees with Master's storage size. Storage drives price by 10–30%; correct Master to match Blackbelt's value.",
-                                      "expected": "Master and Blackbelt to agree on storage size."},
-    "bb_grade_mismatch":             {"problem": "Grade in Master disagrees with Blackbelt's automated grade",
-                                      "fix": "Blackbelt's grade comes from the test machine and is more rigorous than manual grading. Treat BB's grade as authoritative; update Master.",
-                                      "expected": "Master and Blackbelt to agree on Grade."},
-    "bb_color_mismatch":             {"problem": "Color in Master's label disagrees with Blackbelt's recorded color",
-                                      "fix": "Blackbelt recorded a different colour. Verify the asset label and update Master.",
-                                      "expected": "Master's label to mention Blackbelt's recorded colour."},
-    "bb_model_number_mismatch":      {"problem": "Model number code disagrees between Master's label and Blackbelt",
-                                      "fix": "Master's label has a different manufacturer code than Blackbelt recorded. May indicate a different regional variant — verify.",
-                                      "expected": "Master's label model-number code to match Blackbelt."},
-    # L19 — Master ↔ Stack reconciliation
-    "master_stack_grade_mismatch":   {"problem": "Master and Stack-Bulk record different grades for the same IMEI",
+    # Backend vs Blackbelt field reconciliation (Blackbelt is treated as truth)
+    "bb_brand_mismatch":             {"problem": "Backend brand disagrees with Blackbelt",
+                                      "fix": "Blackbelt's hardware test identified a different manufacturer than the backend recorded. Update the backend Brand to match Blackbelt — the test machine reads the brand directly from the device firmware.",
+                                      "expected": "Backend and Blackbelt to agree on Brand."},
+    "bb_model_mismatch":             {"problem": "Backend model disagrees with Blackbelt",
+                                      "fix": "Blackbelt's recorded model name doesn't appear in the backend Asset Label. Update the backend to match Blackbelt's model.",
+                                      "expected": "Backend's label to mention the model Blackbelt recorded."},
+    "bb_storage_mismatch":           {"problem": "Backend storage disagrees with Blackbelt",
+                                      "fix": "Blackbelt's hardware read disagrees with the backend's storage size. Storage drives price by 10–30%; correct the backend to match Blackbelt.",
+                                      "expected": "Backend and Blackbelt to agree on storage size."},
+    "bb_grade_mismatch":             {"problem": "Backend grade disagrees with Blackbelt",
+                                      "fix": "Blackbelt's grade comes from the test machine and is more rigorous than manual grading. Treat Blackbelt's grade as authoritative; update the backend.",
+                                      "expected": "Backend and Blackbelt to agree on Grade."},
+    "bb_color_mismatch":             {"problem": "Backend colour disagrees with Blackbelt",
+                                      "fix": "Backend label and Blackbelt both specify a colour and they disagree. Pull the device — whichever colour matches the physical unit is the correct one. Update the wrong side.",
+                                      "expected": "Backend's label colour to match Blackbelt's recorded colour."},
+    "bb_model_number_mismatch":      {"problem": "Backend model code disagrees with Blackbelt",
+                                      "fix": "The backend label has a different manufacturer code (e.g. Apple A-number, Samsung SM-code) than what Blackbelt recorded. May indicate a regional variant — verify.",
+                                      "expected": "Backend's model code to match Blackbelt."},
+    # Master vs Stack reconciliation (only fires when Master Template uploaded)
+    "master_stack_grade_mismatch":   {"problem": "Master and Stack record different grades for the same IMEI",
                                       "fix": "Two separate graders disagree on the device's grade. Affects price; reconcile with the team and use the more rigorous source.",
                                       "expected": "Master and Stack to agree on Grade."},
     "master_stack_vat_mismatch":     {"problem": "Master and Stack record different VAT classifications",
@@ -1539,24 +1555,43 @@ ADVISORY_ISSUES: set[str] = {
     "stale_inventory",               # L20 — operational, not a data error
 }
 
-# Per-layer metadata for the 'How to Read This Report' guide sheet
+# Per-layer metadata for the 'How to Read This Report' guide sheet.
+# These names show up in the legend so users can match a problem back to the
+# kind of check that produced it. Keep them short and plain-English; the
+# 'How each check works' section in the legend has the deeper explanation.
 LAYER_INFO: list[tuple[str, str, str]] = [
-    ("L1",  "Format check",           "Is the IMEI the right shape (15 digits, passes digit-check)?"),
-    ("L2",  "Wrong column",           "Is a value in the wrong column (serial in IMEI, IMEI in barcode)?"),
-    ("L3",  "Internal consistency",   "Do Brand, Asset Label, and Category agree with each other?"),
-    ("L4",  "Storage catalog check", "Does the storage size exist for this model in Blackbelt?"),
-    ("L5",  "Duplicate rows",         "Is the same IMEI or same unit listed more than once?"),
-    ("L6",  "IMEI1/IMEI2 twin",       "Are dual-SIM IMEIs of one phone listed as two rows?"),
-    ("L7",  "Placeholder data",       "Is the IMEI a test / fake / all-zeros value?"),
-    ("L8",  "Brand column sanity",    "Is the Brand column filled with a real manufacturer?"),
-    ("L9",  "Identity contradiction", "Same IMEI claimed as two different devices?"),
-    ("L10", "Scanned the wrong phone","Does the IMEI prefix match others of this model?"),
-    ("L11", "Model code match",       "Does the Apple/Samsung code in the label match the model?"),
-    ("L12", "Colour catalog",         "Has Blackbelt recorded this model in this colour?"),
-    ("L13", "Storage confusion",      "Does the label mention two different storage sizes?"),
-    ("L14", "Grade vs damage",        "Is a damaged phone graded as excellent?"),
-    ("L15", "QR vs IMEI",             "Do QR code and IMEI column disagree?"),
-    ("L16", "Unknown model",          "Is this model missing from Blackbelt's catalog?"),
+    ("L1",  "IMEI shape check",
+            "The IMEI must be a 15-digit number that passes the standard digit-verification (the same kind credit-card numbers use). If it's the wrong length or fails the check, it can't be a real IMEI."),
+    ("L2",  "Value in the wrong column",
+            "Catches when a serial number was scanned into the IMEI column, or an IMEI was scanned into the Barcode column — the two scans get mixed up at the warehouse."),
+    ("L3",  "Brand / Label / Category agreement",
+            "The Brand field, the Asset Label text, and the Category should all describe the same device. If the Brand says 'Apple' but the label says 'Galaxy S24', one of them is wrong."),
+    ("L4",  "Storage size sanity",
+            "Compares the storage in your label against the sizes Blackbelt has actually seen for this model. A '64GB iPhone 15 Pro' would be flagged because Apple never made one."),
+    ("L5",  "Same device listed twice",
+            "Same IMEI on more than one row, or the same IMEI under more than one Deal ID. One IMEI = one physical device, so this points to a duplicate listing or a Deal-ID mix-up."),
+    ("L6",  "Same phone, both IMEIs",
+            "Modern phones have two IMEIs (dual-SIM). When two rows share the same Asset ID and have IMEIs differing by 1–3, they're probably IMEI1 and IMEI2 of one physical phone listed twice."),
+    ("L7",  "Test / placeholder data",
+            "Catches obvious junk like 000000000000000, 123456789012345, 'TEST', 'DEMO' — values that crept in from training data or sample rows."),
+    ("L8",  "Brand column sanity",
+            "The Brand column should hold a real manufacturer name. Values like 'Others', 'macbooks', 'unknown' or empty are flagged."),
+    ("L9",  "Same IMEI on two different phones",
+            "If the same IMEI shows up on two rows that describe different devices (different brand or model family), at least one is wrong — IMEIs are globally unique."),
+    ("L10", "Scanned the wrong phone (IMEI-prefix check)",
+            "The first 8 digits of every IMEI are a manufacturer code — the same model always shares the same prefix. If most rows of model X share one prefix and one row's prefix is different, that one row was scanned off a different phone on the shelf."),
+    ("L11", "Model code matches model name",
+            "Apple's A-codes (A1234) and Samsung's SM-codes (SM-G991B) appear in some labels. If the code in the label doesn't belong to the named model, either the name or the code is wrong."),
+    ("L12", "Colour Blackbelt has seen for this model",
+            "The colour mentioned in your label should be one Blackbelt has tested for this model. Catches typos and fake variants."),
+    ("L13", "Two different storage sizes in one label",
+            "Asset Label mentions both '128GB' and '256GB' — usually means two listings got merged or a template wasn't fully edited."),
+    ("L14", "Grade contradicts damage in the label",
+            "Grade says A or 'excellent' but the label mentions 'cracked', 'faulty', 'no power', etc. The grade or the description is from the wrong unit."),
+    ("L15", "QR code vs IMEI mismatch",
+            "The QR Code and IMEI columns hold different valid IMEIs. They should be the same; one of them was scanned off a different phone."),
+    ("L16", "Model not in Blackbelt's catalogue",
+            "Blackbelt has no reference data for this model. Not an error — flags an opportunity to extend the catalogue."),
 ]
 
 PRIORITY_DISPLAY = {
@@ -1733,11 +1768,13 @@ _PRIORITY_ORDER = {label: idx for idx, (label, _) in enumerate(PRIORITY_EXPLAIN)
 # at the manager's request.
 _FLAGGED_COLUMNS = [
     "Deal ID", "IMEI", "Blackbelt", "Stack Bulk", "Location",
+    "Stack ID", "VAT Type",
     "Problem", "Field", "Current Value",
 ]
 
 _CLEAN_COLUMNS = [
     "Deal ID", "IMEI", "Blackbelt", "Stack Bulk", "Location",
+    "Stack ID", "VAT Type",
     "Brand", "Asset Label", "Category",
 ]
 
@@ -1759,6 +1796,8 @@ def _friendly_flagged(df: pd.DataFrame,
         "Blackbelt":         imei_series.map(lambda x: bb_by_imei.get(x, "")),
         "Stack Bulk":        imei_series.map(lambda x: stack_by_imei.get(x, "")),
         "Location":          df.get("location_text", pd.Series([""] * len(df))).astype(str),
+        "Stack ID":          df.get("stack_id",  pd.Series([""] * len(df))).astype(str),
+        "VAT Type":          df.get("vat_type",  pd.Series([""] * len(df))).astype(str),
         "Problem":           df["issue"].map(lambda i: issue_info(i, "problem") or i),
         "Field":             df["field"].astype(str),
         "Current Value":     df["current_value"].astype(str),
@@ -1788,6 +1827,8 @@ def _friendly_clean(df: pd.DataFrame,
         "Blackbelt":   imei_series.map(lambda x: bb_by_imei.get(x, "")),
         "Stack Bulk":  imei_series.map(lambda x: stack_by_imei.get(x, "")),
         "Location":    df.get("location_text", pd.Series([""] * len(df))).astype(str),
+        "Stack ID":    df.get("stack_id", pd.Series([""] * len(df))).astype(str),
+        "VAT Type":    df.get("vat_type", pd.Series([""] * len(df))).astype(str),
         "Brand":       df["brand"].astype(str),
         "Asset Label": df["asset_label"].astype(str),
         "Category":    df["category"].astype(str),
@@ -1858,6 +1899,8 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
         write("Blackbelt",   "What the Blackbelt reference file records for this IMEI (Brand + Model). Blank if no Blackbelt record exists for this IMEI.")
         write("Stack Bulk",  "What the Stack Bulk Upload file records for this IMEI (Asset Label). Blank if Stack Bulk wasn't uploaded or has no row for this IMEI.")
         write("Location",    "Physical warehouse location — Room / Bin / Location for Master Template rows; storage member for Stack Bulk rows.")
+        write("Stack ID",    "Internal warehouse stack identifier + dealer (Stack Bulk only). Blank for Master Template rows.")
+        write("VAT Type",    "VAT classification for the device (e.g. 'standard', 'margin').")
         write("Brand",       "Manufacturer.")
         write("Asset Label", "The product description recorded against this unit.")
         write("Category",    "Product category (Mobile Phone, Tablet, Laptop, etc.).")
@@ -1876,14 +1919,29 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
     write("Blackbelt",         "What the Blackbelt reference file records for this IMEI (Brand + Model). Blank if no Blackbelt record exists for this IMEI.")
     write("Stack Bulk",        "What the Stack Bulk Upload file records for this IMEI (Asset Label). Blank if Stack Bulk wasn't uploaded or has no row for this IMEI.")
     write("Location",          "Physical warehouse location — Room / Bin / Location for Master Template rows; storage member for Stack Bulk rows.")
+    write("Stack ID",          "Internal warehouse stack identifier + dealer name for Stack Bulk rows (the 'Existing stack Id & Dealer' column). Blank for Master Template rows. Useful to group flagged rows by which warehouse/dealer is producing them.")
+    write("VAT Type",          "VAT classification for the device (e.g. 'standard', 'margin'). Pulled from 'Appraisal VATType' or 'VAT Type' on Stack Bulk; from 'VAT Type' on Master.")
     write("Problem",           "Plain-English description of what looks wrong.")
     write("Field",             "The column in the source data where the problem sits.")
     write("Current Value",     "The value that was found in that column.")
     write("", "")
 
-    write("Check types", "", section=True)
-    for code, name, desc in LAYER_INFO:
-        write(f"{code} – {name}", desc)
+    write("Types of checks the model runs", "", section=True)
+    for _code, name, desc in LAYER_INFO:
+        write(name, desc)
+    # Cross-file checks (no L17–L22 codes shown; descriptions only).
+    write("Device hasn't been Blackbelt-tested",
+          "The IMEI is well-formed but doesn't appear in the Blackbelt file. Either Blackbelt hasn't tested this device yet, or the row didn't get included in the latest BB pull.")
+    write("Backend disagrees with Blackbelt",
+          "When the same IMEI appears in both files, we compare what the backend recorded (brand, model, storage, grade, colour, model number) against what Blackbelt's test machine produced. Disagreements are flagged with Blackbelt as the truth source.")
+    write("Backend disagrees with Stack Bulk",
+          "When a Master Template row matches a Stack Bulk row by IMEI or Deal ID, we cross-check grade, VAT, and country. Helps catch records that drifted between the two systems.")
+    write("Stale inventory",
+          "Devices whose Deal date is more than 12 months old. Operational signal — long-held inventory ties up capital and may need a price drop.")
+    write("Blackbelt failed a hardware test",
+          "Blackbelt's automated test machine recorded one or more failures (battery, screen, microphone, etc.). The device shouldn't be listed as fully working.")
+    write("Blackbelt detected non-original parts",
+          "Blackbelt's parts check flagged a component as non-genuine — battery, screen, etc. Material disclosure for resale.")
     write("", "")
 
     write("Problem catalogue", "", section=True)
@@ -1932,11 +1990,42 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
     write("", "")
 
     # ------------------------------------------------------------------
+    # Deep-dive: how the non-obvious checks actually work, with worked
+    # examples. Lives in the report so anyone opening a downloaded file
+    # can self-serve, even if they're not technical.
+    # ------------------------------------------------------------------
+    write("How each check works (deep dive)", "", section=True)
+
+    write("Scanned the wrong phone — how the prefix check works",
+          "Every IMEI starts with an 8-digit code called the TAC (Type Allocation Code). The TAC identifies the make and model of the phone — every iPhone 15 Pro Max ever made shares the same TAC; every Galaxy S24 shares another. The TAC is permanently registered with the GSMA (the global mobile-industry body) by the manufacturer; you can't fake it or change it. So the model groups all the rows in your inventory that claim to be the same model, and looks at the TAC of each. If 49 rows out of 50 share one TAC and 1 row has a different one, that 1 row was almost certainly scanned off a different phone on the shelf. The label says iPhone 15 Pro Max, but the IMEI tells GSMA the device is something else.")
+    write("Worked example",
+          "A batch of 9 rows all labelled 'iPhone 13 Pro (2021)'. Eight of them have IMEIs starting with 35519675, 35308430, 35688519, 35631070 or 35283598 — these are five legitimate iPhone 13 Pro TACs (Apple ships several variants per model: US carrier-locked, EU dual-SIM, mainland China, etc.). The 9th row has an IMEI starting with 35706653, which isn't an iPhone 13 Pro TAC. The label is wrong, the IMEI is wrong, or the operator picked up the wrong device. Pull the physical device for that row and re-scan.")
+    write("When this check fires",
+          "Only when the cohort has at least 5 rows, and at least one TAC repeats 3+ times in the cohort. We don't flag anything in tiny batches because there's no statistical basis. We also don't flag if the cohort has no clearly dominant TAC — that suggests it's a mixed batch, not a scanning error.")
+    write("", "")
+
+    write("Same phone, two IMEIs — how the dual-SIM check works",
+          "Modern phones (most made after ~2018) have two SIM slots, and therefore two IMEIs. The two IMEIs of a single phone are usually consecutive numbers — e.g. 354808110221304 and 354808110221305 — because the manufacturer assigns them in pairs from one batch. So if two rows in your inventory share the same Asset ID AND their IMEIs differ by 1, 2, or 3, they're probably IMEI1 and IMEI2 of one physical phone that got listed twice. Keep one row per phone and delete the duplicate.")
+    write("", "")
+
+    write("Wrong column — how the scan-slot check works",
+          "Phones have a 15-digit IMEI; serials look totally different (Samsung serials start with 'R', Apple serials are 10–12 alphanumeric characters, etc.). When the IMEI column holds something that looks like a serial (e.g. 'RK8N40ABC123'), the operator scanned the back-of-device sticker into the wrong column. The check also fires the other direction — when a 15-digit number that passes the IMEI digit-check sits in the Barcode column, that's an IMEI scanned where a barcode should be.")
+    write("", "")
+
+    write("Backend vs Blackbelt — why we trust Blackbelt as the source of truth",
+          "Blackbelt's values come from a physical hardware test machine that reads identifiers directly from the device firmware (the same way the device's own settings page reads them). Backend values are typed in by humans during intake. When a row's IMEI is in both files and they disagree on brand / model / storage / grade / colour, we treat Blackbelt as the answer and the backend as the row that needs fixing. Grade in particular is the priority — Blackbelt's grade comes from automated diagnostics rather than a human eye, so disagreements affect pricing.")
+    write("", "")
+
+    write("Why colour and storage only flag when both files have a value",
+          "If your backend label doesn't mention a colour at all, that's incomplete data — not a colour mismatch. The model only flags a colour disagreement when the backend label explicitly says one colour AND Blackbelt recorded a different colour. The same rule applies to storage. Identity errors (missing IMEI, wrong column) are flagged regardless because those are operator scan errors, not feature data.")
+    write("", "")
+
+    # ------------------------------------------------------------------
     # About the IMEI Luhn check — why we keep this rule, and how it works.
     # Same explainer the team walked through; lives in the report so anyone
     # opening a downloaded file can self-serve.
     # ------------------------------------------------------------------
-    write("About the IMEI Luhn check", "", section=True)
+    write("The IMEI digit-check (Luhn) in detail", "", section=True)
     write("Why this rule exists",
           "Every genuine IMEI is required by the GSMA (the global mobile-industry body) to satisfy the Luhn checksum — the same arithmetic check used for credit-card numbers. The standard is in 3GPP TS 23.003 §6.2. Phone manufacturers, carriers, the GSMA IMEI Database, and stolen-phone registries (CEIR, etc.) all enforce it. So if a row in your inventory fails Luhn, the value cannot be a real IMEI — it is mathematically guaranteed to be a scanner mis-read, typo, or fabricated number.")
     write("What it catches",
@@ -1978,6 +2067,7 @@ def _build_grade_mismatch_table(flags_df: pd.DataFrame, co: pd.DataFrame,
                                 bb_by_imei: dict) -> pd.DataFrame:
     """One row per bb_grade_mismatch flag with full backend context."""
     cols = ["Deal ID", "AssetId", "IMEI", "Brand", "Asset Label",
+            "Stack ID", "VAT Type",
             "Backend Grade", "Blackbelt Grade", "Direction", "Suggested Fix"]
     if not len(flags_df):
         return pd.DataFrame(columns=cols)
@@ -2015,6 +2105,8 @@ def _build_grade_mismatch_table(flags_df: pd.DataFrame, co: pd.DataFrame,
             "IMEI":            str(co_row["imei"]) if co_row is not None else "",
             "Brand":           str(co_row["brand"]) if co_row is not None else "",
             "Asset Label":     str(co_row["asset_label"]) if co_row is not None else "",
+            "Stack ID":        str(co_row.get("stack_id", "")) if co_row is not None else "",
+            "VAT Type":        str(co_row.get("vat_type", "")) if co_row is not None else "",
             "Backend Grade":   sk_grade_raw,
             "Blackbelt Grade": bb_grade_raw,
             "Direction":       _direction(sk_grade_raw, bb_grade_raw),
@@ -2293,6 +2385,19 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
         print(f"  {name}: {len(added)} flags")
         flags.extend(added)
 
+    # Wrong Model suppression — rows whose Stack ID was already manually
+    # tagged "Wrong Model" by the team are excluded from automated flagging,
+    # so the model isn't re-surfacing problems analysts already know about.
+    # We track the suppressed count separately for the comparison visual.
+    wrong_model_co_rows = set(int(r["co_row"]) for _, r in co.iterrows()
+                              if r.get("is_wrong_model"))
+    wrong_model_stack_count = len(wrong_model_co_rows)
+    if wrong_model_co_rows:
+        before = len(flags)
+        flags = [f for f in flags if int(f.co_row) not in wrong_model_co_rows]
+        print(f"  Wrong Model suppression: dropped {before - len(flags)} flags "
+              f"on {wrong_model_stack_count} pre-tagged rows")
+
     # IMEI-recovery enrichment: when L1 flagged a bad IMEI and Stack Bulk has
     # a valid IMEI for the same Deal ID, append the suggested correction to
     # the L1 flag's fix text so the analyst sees the answer inline.
@@ -2348,7 +2453,7 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     # Bulk / Location).
     if len(worst_df):
         co_extra = co[["co_row", "imei", "location_text", "brand",
-                       "asset_label", "category"]].copy()
+                       "asset_label", "category", "stack_id", "vat_type"]].copy()
         co_extra["co_row"] = co_extra["co_row"].astype(int)
         worst_df["co_row"] = worst_df["co_row"].astype(int)
         worst_df = worst_df.merge(co_extra, on="co_row", how="left")
@@ -2371,7 +2476,9 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
          "appraisal": str(r["appraisal"]),
          "imei": r["imei"], "brand": r["brand"],
          "asset_label": r["asset_label"], "category": r["category"],
-         "location_text": str(r.get("location_text", "") or "")}
+         "location_text": str(r.get("location_text", "") or ""),
+         "stack_id": str(r.get("stack_id", "") or ""),
+         "vat_type": str(r.get("vat_type", "") or "")}
         for _, r in co.iterrows() if int(r["co_row"]) not in flagged_co_rows
     ]
 
@@ -2407,6 +2514,122 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
                               .sort_values("count", ascending=False)
                               .to_dict(orient="records")
                    if len(grade_table) else [])
+
+    # Per-issue Excel files — one xlsx per check type so the UI can offer a
+    # download button for every check separately, including advisories. Each
+    # file holds all flags of that issue (not just the per-row worst), joined
+    # to co context so Stack ID / VAT / Location / Brand etc. show up.
+    by_issue_dir = out_dir / "by_issue"
+    by_issue_dir.mkdir(exist_ok=True)
+    by_issue_files: dict[str, str] = {}
+    flags_full = pd.DataFrame()
+    if len(flags_df):
+        co_ctx = co[["co_row", "imei", "location_text", "brand", "asset_label",
+                     "category", "stack_id", "vat_type"]].copy()
+        co_ctx["co_row"] = co_ctx["co_row"].astype(int)
+        flags_full = flags_df.copy()
+        flags_full["co_row"] = flags_full["co_row"].astype(int)
+        flags_full = flags_full.merge(co_ctx, on="co_row", how="left")
+        for issue_code, sub in flags_full.groupby("issue"):
+            safe = re.sub(r"[^a-zA-Z0-9_]+", "_", str(issue_code)).strip("_") or "issue"
+            fname = f"{safe}.xlsx"
+            _write_excel_report(sub.to_dict(orient="records"),
+                                by_issue_dir / fname,
+                                is_flagged=True,
+                                bb_by_imei=bb_by_imei,
+                                stack_by_imei=stack_by_imei)
+            by_issue_files[str(issue_code)] = fname
+
+    # ------------------------------------------------------------------
+    # PRIORITY CATEGORIES — only 5 buckets the team currently cares about.
+    # Each gets its own Excel; everything else still runs but stays hidden
+    # in the UI (kept for safety / future re-enablement).
+    # ------------------------------------------------------------------
+    PRIORITY_CATEGORIES = {
+        "brand_mismatch":    {"issues": ["bb_brand_mismatch"],
+                              "label":  "Brand mismatch",
+                              "file":   "category_brand_mismatch.xlsx"},
+        "model_mismatch":    {"issues": ["bb_model_mismatch"],
+                              "label":  "Model / Asset mismatch",
+                              "file":   "category_model_mismatch.xlsx"},
+        "storage_mismatch":  {"issues": ["bb_storage_mismatch"],
+                              "label":  "Storage mismatch",
+                              "file":   "category_storage_mismatch.xlsx"},
+        "grade_mismatch":    {"issues": ["bb_grade_mismatch"],
+                              "label":  "Grade mismatch",
+                              "file":   "category_grade_mismatch.xlsx"},
+        "not_in_blackbelt":  {"issues": ["not_in_blackbelt"],
+                              "label":  "Device not in Blackbelt",
+                              "file":   "category_not_in_blackbelt.xlsx"},
+    }
+    category_counts: dict[str, int] = {}
+    category_files:  dict[str, str] = {}
+    for key, meta in PRIORITY_CATEGORIES.items():
+        sub = flags_full[flags_full["issue"].isin(meta["issues"])] if len(flags_full) else flags_full
+        n = int(len(sub))
+        category_counts[key] = n
+        _write_excel_report(sub.to_dict(orient="records") if n else [],
+                            out_dir / meta["file"],
+                            is_flagged=True,
+                            bb_by_imei=bb_by_imei,
+                            stack_by_imei=stack_by_imei)
+        category_files[key] = meta["file"]
+
+    # ------------------------------------------------------------------
+    # PRODUCT AGE — bucket every backend row by trade-in date for the UI.
+    # User picks a granularity (Annual / Semi-annual / Quarterly / Monthly)
+    # and the dashboard groups rows by that interval. Download includes
+    # every row with all four bucket assignments so the analyst can pivot.
+    # ------------------------------------------------------------------
+    age_rows = []
+    today = datetime.now().date() if False else __import__("datetime").date.today()
+    for _, r in co.iterrows():
+        d = r.get("deal_date")
+        if not d:
+            continue
+        try:
+            from datetime import date as _date
+            dd = _date.fromisoformat(d)
+        except (ValueError, TypeError):
+            continue
+        days_old = (today - dd).days
+        q = (dd.month - 1) // 3 + 1
+        h = 1 if dd.month <= 6 else 2
+        age_rows.append({
+            "Deal ID":        str(r.get("appraisal", "") or ""),
+            "IMEI":           str(r.get("imei", "") or ""),
+            "Brand":          str(r.get("brand", "") or ""),
+            "Asset Label":    str(r.get("asset_label", "") or ""),
+            "Category":       str(r.get("category", "") or ""),
+            "Stack ID":       str(r.get("stack_id", "") or ""),
+            "Trade-in Date":  dd.isoformat(),
+            "Days Old":       days_old,
+            "Monthly":        dd.strftime("%Y-%m"),
+            "Quarterly":      f"{dd.year}-Q{q}",
+            "Semi-annual":    f"{dd.year}-H{h}",
+            "Annual":         str(dd.year),
+        })
+    age_df = pd.DataFrame(age_rows)
+    age_file = "product_age.xlsx"
+    if len(age_df):
+        with pd.ExcelWriter(out_dir / age_file, engine="openpyxl") as xw:
+            age_df.to_excel(xw, sheet_name="Product Age", index=False)
+            _style_data_sheet(xw.sheets["Product Age"], n_rows=len(age_df))
+
+    # Bucket counts for each granularity (sorted chronologically by key).
+    def _counts(col):
+        if not len(age_df): return []
+        s = age_df[col].value_counts().reset_index()
+        s.columns = ["bucket", "count"]
+        return s.sort_values("bucket").to_dict(orient="records")
+    product_age_summary = {
+        "total_with_date": int(len(age_df)),
+        "monthly":         _counts("Monthly"),
+        "quarterly":       _counts("Quarterly"),
+        "semi_annual":     _counts("Semi-annual"),
+        "annual":          _counts("Annual"),
+        "file":            age_file,
+    }
 
     # Summary (also fed to the UI as `results`)
     by_severity = dict(Counter(f.severity for f in flags))
@@ -2445,6 +2668,40 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
             "joinable":  int(sum(1 for _, r in co.iterrows()
                                  if str(r["imei"]) in bb_records)) if bb_records else 0,
         },
+
+        # Per-issue download files — issue_code -> filename inside out_dir/by_issue/.
+        # Streamlit uses this to render a download button next to every issue.
+        "by_issue_files": by_issue_files,
+
+        # Priority categories — only these 5 are surfaced in the UI per current spec.
+        # (All other layers still run; their files exist on disk but are hidden.)
+        "categories": {
+            "brand_mismatch":   {"label": "Brand mismatch",
+                                 "count": category_counts["brand_mismatch"],
+                                 "file":  category_files["brand_mismatch"]},
+            "model_mismatch":   {"label": "Model / Asset mismatch",
+                                 "count": category_counts["model_mismatch"],
+                                 "file":  category_files["model_mismatch"]},
+            "storage_mismatch": {"label": "Storage mismatch",
+                                 "count": category_counts["storage_mismatch"],
+                                 "file":  category_files["storage_mismatch"]},
+            "grade_mismatch":   {"label": "Grade mismatch",
+                                 "count": category_counts["grade_mismatch"],
+                                 "file":  category_files["grade_mismatch"]},
+            "not_in_blackbelt": {"label": "Device not in Blackbelt",
+                                 "count": category_counts["not_in_blackbelt"],
+                                 "file":  category_files["not_in_blackbelt"]},
+        },
+
+        # Wrong Model comparison — Stack-tagged rows already known by the team
+        # vs the model-mismatch rows our detector found independently.
+        "wrong_model_comparison": {
+            "stack_tagged_count":    int(wrong_model_stack_count),
+            "model_flagged_count":   int(category_counts["model_mismatch"]),
+        },
+
+        # Product age buckets for the dashboard granularity selector.
+        "product_age": product_age_summary,
 
         # Detector-internal fields (useful for debugging / exports)
         "detector": {
