@@ -277,40 +277,46 @@ if "summary" in st.session_state:
                    "treat it as authoritative. Download the dedicated file below to "
                    "fix these in the backend.")
 
-    # --- Wrong Model comparison: stack-tagged vs auto-flagged ---
-    st.markdown("#### 🆚 Wrong-model coverage")
-    wm_stack = int(wm.get("stack_tagged_count", 0))
-    wm_auto  = int(wm.get("model_flagged_count", 0))
-    wmc1, wmc2 = st.columns([3, 2])
-    with wmc1:
-        wm_fig = go.Figure(go.Bar(
-            x=["Already tagged in Stack", "Newly flagged by model"],
-            y=[wm_stack, wm_auto],
-            text=[f"{wm_stack:,}", f"{wm_auto:,}"],
-            textposition="outside",
-            marker=dict(color=["#a0a0a0", "#ff6b6b"]),
-            hovertemplate="<b>%{x}</b><br>%{y:,} devices<extra></extra>",
-        ))
-        wm_fig.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font_color="#e0e0e0",
-            margin=dict(l=10, r=10, t=20, b=10),
-            height=280,
-            yaxis=dict(title="Devices", gridcolor="#1a1a2e"),
-        )
-        st.plotly_chart(wm_fig, use_container_width=True)
-    with wmc2:
-        st.metric("Stack-tagged 'Wrong Model'", f"{wm_stack:,}",
-                  help="Rows your team had already manually marked as wrong model "
-                       "in Stack — these are skipped from auto-flagging.")
-        st.metric("Auto-flagged Model mismatch", f"{wm_auto:,}",
-                  help="New model mismatches the detector found beyond the team's "
-                       "manual list.")
-        if wm_stack + wm_auto > 0:
-            new_pct = 100 * wm_auto / max(wm_stack + wm_auto, 1)
-            st.caption(f"The detector found **{new_pct:.0f}%** more wrong-model "
-                       f"rows than the team had pre-tagged.")
+    # --- Priority Issues comparison: Stack-flagged vs Auto-detected ---
+    st.markdown("#### 🆚 Priority Issues Coverage")
+    st.caption("Comparison of devices already flagged in Stack vs. new issues detected by our analysis")
+    
+    wm_stack = int(wm.get("already_flagged_in_stack", 0))
+    wm_auto  = int(wm.get("total_mismatches", 0))
+    
+    # Only show chart if there's data
+    if wm_stack > 0 or wm_auto > 0:
+        wmc1, wmc2 = st.columns([3, 2])
+        with wmc1:
+            wm_fig = go.Figure(go.Bar(
+                x=["Already flagged in Stack", "Auto-detected issues"],
+                y=[wm_stack, wm_auto],
+                text=[f"{wm_stack:,}", f"{wm_auto:,}"],
+                textposition="outside",
+                marker=dict(color=["#a0a0a0", "#ff6b6b"]),
+                hovertemplate="<b>%{x}</b><br>%{y:,} devices<extra></extra>",
+            ))
+            wm_fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#e0e0e0",
+                margin=dict(l=10, r=10, t=20, b=10),
+                height=280,
+                yaxis=dict(title="Devices", gridcolor="#1a1a2e", range=[0, max(wm_stack, wm_auto, 1) * 1.2]),
+            )
+            st.plotly_chart(wm_fig, use_container_width=True)
+        with wmc2:
+            st.metric("Already flagged in Stack", f"{wm_stack:,}",
+                      help="Rows your team had already manually marked as 'Wrong Model' "
+                           "in Stack — these are excluded from our auto-detection.")
+            st.metric("Auto-detected issues", f"{wm_auto:,}",
+                      help="Total priority issues found: Brand + Model + Storage + Grade mismatches + Not in Blackbelt")
+            if wm_stack + wm_auto > 0:
+                new_pct = 100 * wm_auto / max(wm_stack + wm_auto, 1)
+                st.caption(f"Our detector found **{new_pct:.0f}%** of the total issues, "
+                           f"beyond what was already manually flagged.")
+    else:
+        st.info("No comparison data available. Upload files to see the analysis.")
 
     # --- Product Age section ---
     if age_block.get("total_with_date", 0) > 0:
