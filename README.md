@@ -2,38 +2,47 @@
 
 Production-ready web application to detect and correct IMEI/model mismatches between Blackbelt device testing data and NorthLadder inventory.
 
-## Features
+## 🌟 Two Ways to Use
 
-✅ **Modern Web Interface**
-- Drag-and-drop file upload
-- Real-time progress tracking
-- Interactive dashboard with charts
-- Category-based error reporting
-- Product age analysis
+### 1. **Streamlit Cloud** (Recommended for Sharing)
+- ✅ **Completely FREE**
+- ✅ Share with colleagues via public URL
+- ✅ Auto-deploys from GitHub
+- ✅ No server setup needed
 
-✅ **Intelligent Detection Engine**
-- Exact IMEI matching
-- Brand, model, and storage validation
-- Grade mismatch detection
-- Blackbelt reference checking
-- Duplicate detection
+### 2. **Local FastAPI** (For Development)
+- ✅ Beautiful custom interface
+- ✅ Run on your machine
+- ✅ Full control
 
-✅ **Comprehensive Reporting**
-- Brand mismatches
-- Model mismatches
-- Storage mismatches
-- Grade mismatches
-- Devices not in Blackbelt
-- Product age distribution
-- Clean rows (no issues)
+---
 
-✅ **Export Options**
-- Download by category (Excel)
-- Product age analysis
-- Complete ZIP bundle
-- Summary JSON
+## 🚀 Quick Start - Streamlit Cloud (FREE)
 
-## Quick Start
+### Deploy to Streamlit Cloud:
+
+1. **Fork/Clone this repository** to your GitHub account
+
+2. **Go to [share.streamlit.io](https://share.streamlit.io)**
+
+3. **Sign in with GitHub**
+
+4. **Click "New app"**
+
+5. **Fill in the details:**
+   - Repository: `your-username/North-ladder-balcbelt-vs-backend-`
+   - Branch: `main`
+   - Main file path: `streamlit_app.py`
+
+6. **Click "Deploy"**
+
+7. **Share the URL** with your colleagues! 🎉
+
+That's it! Your app will be live at: `https://your-app-name.streamlit.app`
+
+---
+
+## 💻 Local Development
 
 ### Installation
 
@@ -41,34 +50,76 @@ Production-ready web application to detect and correct IMEI/model mismatches bet
 pip install -r requirements.txt
 ```
 
-### Run the Web Application
+### Run Streamlit UI (Recommended)
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Opens at: **http://localhost:8501**
+
+### Run FastAPI UI (Alternative)
 
 ```bash
 python app.py
 ```
 
-Then open your browser to: **http://localhost:8000**
+Opens at: **http://localhost:8000**
 
-### Using the Web Interface
+---
 
-1. **Upload Files:**
-   - Blackbelt Excel Report (required)
-   - Stack Bulk Upload (required)
-   - Master Template (optional)
+---
 
-2. **Start Analysis:**
-   - Click "Start Analysis" button
-   - Watch real-time progress
+## ✨ Features
 
-3. **View Results:**
-   - See summary statistics
-   - Review charts and breakdowns
-   - Download category-specific reports
+### **Intelligent Detection Engine**
+- ✅ Exact IMEI matching
+- ✅ Brand, model, and storage validation
+- ✅ Grade mismatch detection
+- ✅ Blackbelt reference checking
+- ✅ Duplicate detection
+- ✅ Product age analysis
 
-4. **Export Data:**
-   - Download individual category files
-   - Get product age analysis
-   - Export everything as ZIP
+### **Comprehensive Reporting**
+- 🏭 Brand mismatches
+- 📱 Model mismatches
+- 💾 Storage mismatches
+- 🏷 Grade mismatches
+- 📡 Devices not in Blackbelt
+- 📅 Product age distribution
+- ✅ Clean rows (no issues)
+
+### **User-Friendly Interface**
+- Drag-and-drop file upload
+- Real-time progress tracking
+- Interactive charts with Plotly
+- Category-based downloads
+- Complete ZIP export
+
+---
+
+## 📋 How to Use
+
+### Step 1: Upload Files
+- **Blackbelt Excel Report** (required) - Reference data from device testing
+- **Stack Bulk Upload** (required) - Your inventory file to check
+- **Master Template** (optional) - Additional cross-check
+
+### Step 2: Run Analysis
+- Click "🚀 Run Analysis"
+- Wait for processing (usually 1-3 minutes)
+
+### Step 3: Review Results
+- View summary statistics
+- Check category breakdowns
+- Review charts and insights
+
+### Step 4: Download Reports
+- Download by category (Excel files)
+- Get product age analysis
+- Export everything as ZIP
+
+---
 
 ## How It Works
 
