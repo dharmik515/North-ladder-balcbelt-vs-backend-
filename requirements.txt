@@ -1,9 +1,6 @@
 pandas>=2.0.0
 openpyxl>=3.1.0
 rapidfuzz>=2.0.0
-streamlit>=1.30.0
-plotly>=5.18.0
-# FastAPI version (app.py) — kept so the original UI still runs locally:
 fastapi>=0.104.0
 uvicorn>=0.24.0
 python-multipart>=0.0.5

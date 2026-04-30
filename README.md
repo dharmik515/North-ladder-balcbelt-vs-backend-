@@ -1,186 +1,165 @@
 # Blackbelt-NorthLadder Mismatch Detection Pipeline
 
-Production-ready pipeline to detect and correct IMEI/model mismatches between Blackbelt device testing data and NorthLadder inventory.
+Production-ready web application to detect and correct IMEI/model mismatches between Blackbelt device testing data and NorthLadder inventory.
 
 ## Features
 
-✅ **Three-layer matching engine**
+✅ **Modern Web Interface**
+- Drag-and-drop file upload
+- Real-time progress tracking
+- Interactive dashboard with charts
+- Category-based error reporting
+- Product age analysis
+
+✅ **Intelligent Detection Engine**
 - Exact IMEI matching
-- Alternate IMEI (`IMEI2`) detection  
-- Fuzzy brand/model/spec matching
+- Brand, model, and storage validation
+- Grade mismatch detection
+- Blackbelt reference checking
+- Duplicate detection
 
-✅ **Confidence-tiered reporting**
-- High confidence (≥90%) — auto-safe corrections
-- Medium confidence (70-89%) — review before applying
-- Low confidence (60-69%) — manual investigation
-- Unmatched — no Blackbelt record found
+✅ **Comprehensive Reporting**
+- Brand mismatches
+- Model mismatches
+- Storage mismatches
+- Grade mismatches
+- Devices not in Blackbelt
+- Product age distribution
+- Clean rows (no issues)
 
-✅ **Analyst review interface**
-- Interactive decision tool
-- Correction script generation
-- Summary statistics
+✅ **Export Options**
+- Download by category (Excel)
+- Product age analysis
+- Complete ZIP bundle
+- Summary JSON
 
-✅ **Robust Excel parsing**
-- Handles corrupted Excel validation rules
-- Supports both Blackbelt and company file formats
-- Fallback loaders
+## Quick Start
 
-## Files
-
-| File | Purpose |
-|------|---------|
-| `blackbelt_mismatch_pipeline.py` | Main matching engine |
-| `review_and_apply.py` | Analyst review & correction tool |
-| `requirements.txt` | Python dependencies |
-| `RESULTS_SUMMARY.md` | This run's findings & recommendations |
-| `output/` | Generated CSV reports |
-
-## Installation
+### Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
-
-### 1. Run the Pipeline
+### Run the Web Application
 
 ```bash
-python blackbelt_mismatch_pipeline.py \
-  --blackbelt "C:/path/to/Blackbelt.xlsx" \
-  --company "C:/path/to/NorthLadder.xlsx" \
-  --output output
+python app.py
 ```
 
-**Output**: 4 CSV files in `output/`
-- `high_confidence_matches.csv` (if any found)
-- `medium_confidence_matches.csv` (if any found)  
-- `low_confidence_matches.csv` (fuzzy candidates)
-- `unmatched.csv` (no match found)
+Then open your browser to: **http://localhost:8000**
 
-### 2. View Summary
+### Using the Web Interface
 
-```bash
-python review_and_apply.py --output-dir output --summary
-```
+1. **Upload Files:**
+   - Blackbelt Excel Report (required)
+   - Stack Bulk Upload (required)
+   - Master Template (optional)
 
-Prints match statistics:
-```
-=== MATCHING SUMMARY ===
-High Confidence Matches: 0 (0.0%)
-Medium Confidence Matches: 0 (0.0%)
-Low Confidence Matches: 117 (2.9%)
-Unmatched: 3,853 (97.1%)
-Total Records: 3,970
-```
+2. **Start Analysis:**
+   - Click "Start Analysis" button
+   - Watch real-time progress
 
-### 3. Review & Approve Corrections
+3. **View Results:**
+   - See summary statistics
+   - Review charts and breakdowns
+   - Download category-specific reports
 
-Interactive mode — approve or reject suggested corrections:
-
-```bash
-python review_and_apply.py --output-dir output --level low
-```
-
-For each record, choose:
-- `A` = Approve correction
-- `R` = Reject  
-- `S` = Skip to next
-- `Q` = Quit
-
-Output: `corrections_low.csv` with approved corrections
+4. **Export Data:**
+   - Download individual category files
+   - Get product age analysis
+   - Export everything as ZIP
 
 ## How It Works
 
-### Matching Algorithm
+### Detection Categories
 
-**Layer 1: Exact IMEI (100% confidence)**
+**1. Brand Mismatch**
+- Compares backend brand with Blackbelt's reading
+- Flags discrepancies for correction
+
+**2. Model Mismatch**
+- Validates asset label against Blackbelt model
+- Detects wrong model entries
+
+**3. Storage Mismatch**
+- Checks storage capacity consistency
+- Identifies incorrect storage specifications
+
+**4. Grade Mismatch**
+- Compares backend grade with Blackbelt's automated grading
+- Highlights grading inconsistencies
+
+**5. Not in Blackbelt**
+- Identifies devices with valid IMEI not found in Blackbelt
+- May indicate untested devices or data sync issues
+
+### Output Format
+
+Each Excel report includes:
+
+| Column | Description |
+|--------|-------------|
+| `Deal ID` | Unique transaction identifier |
+| `IMEI` | Device IMEI number |
+| `Blackbelt` | Data from Blackbelt reference |
+| `Stack Bulk` | Data from inventory system |
+| `Location` | Device location |
+| `Stack ID` | Internal inventory ID |
+| `VAT Type` | VAT classification |
+| `Problem` | Issue description |
+| `Field` | Affected field name |
+| `Current Value` | Current incorrect value |
+
+## API Endpoints
+
+The application provides RESTful API endpoints:
+
+- `GET /` - Web interface
+- `POST /api/upload` - Upload files and start analysis
+- `GET /api/job/{job_id}` - Check job status
+- `GET /api/results/{job_id}` - Get analysis results
+- `GET /api/download/{job_id}/{report_type}` - Download specific report
+- `GET /api/export/{job_id}` - Download all results as ZIP
+
+## Architecture
+
 ```
-IF company.IMEI == Blackbelt.IMEI
-  → MATCH (return immediately)
+app.py                          # FastAPI web server
+├── static/
+│   ├── index.html             # Web interface
+│   ├── app.js                 # Frontend logic
+│   └── style.css              # Styling
+├── mismatch_detector.py       # Core detection engine
+├── blackbelt_mismatch_pipeline.py  # Pipeline logic
+└── requirements.txt           # Dependencies
 ```
 
-**Layer 2: Alternate IMEI (100% confidence, indicates human error)**
+## Troubleshooting
+
+### Port Already in Use
+
+If port 8000 is busy:
+```bash
+# Windows
+netstat -ano | findstr :8000
+taskkill /PID <process_id> /F
+
+# Or change the port in app.py
+uvicorn.run("app:app", host="0.0.0.0", port=8001)
 ```
-IF company.IMEI == Blackbelt.IMEI2
-  → MATCH (likely scanned wrong IMEI)
-```
 
-**Layer 3: Fuzzy Matching (≥60% confidence)**
-```
-FOR each Blackbelt record:
-  IF brand_similarity ≥ 40% AND 
-     (storage matches OR not specified) AND
-     computed_score ≥ 60%
-    → CANDIDATE (return top match)
-```
+### Excel Loading Errors
 
-### Scoring Formula
+- Ensure files are valid XLSX format
+- Check that required sheets exist
+- Verify file permissions
 
-Weighted attributes:
-- Brand match: 25%
-- Model match: 35%
-- Storage match: 15%
-- Color match: 10%
-- Serial/ID match: 15%
+### Processing Takes Too Long
 
-## Output Format
-
-Each report CSV includes:
-
-| Column | Meaning |
-|--------|---------|
-| `decision` | `AUTO_CORRECT`, `REVIEW`, or `MANUAL_REVIEW` |
-| `confidence_score` | 0-100 match quality |
-| `match_reason` | `exact_imei`, `exact_imei2`, `fuzzy_model`, `no_match` |
-| `correction_needed` | `YES` if data conflicts; `NO` if consistent |
-| `suggested_correction` | Specific change to apply |
-| `company_*` | Current data in NorthLadder |
-| `blackbelt_*` | Matching record from Blackbelt |
-
-## Common Issues
-
-### 97%+ Unmatched Records?
-
-Likely causes:
-1. **IMEI format mismatch** — Check if company uses different identifier (device ID vs IMEI)
-2. **Data source lag** — Company inventory may not have been sent to Blackbelt yet
-3. **Different time periods** — Blackbelt data = tested devices; Company = recently purchased
-4. **Dealer/batch isolation** — Different inventory sources
-
-**Resolution**: See `RESULTS_SUMMARY.md` for investigation steps
-
-### Pipeline Runs Slowly?
-
-The algorithm filters candidates before fuzzy matching:
-- Brand similarity ≥40% (required)
-- Storage must match exactly (if present)
-- Only top 10,000 Blackbelt records evaluated per company record
-
-To optimize further, can:
-- Increase brand similarity threshold
-- Pre-group by device category
-- Use serial/barcode matching first
-
-### Excel Loading Errors?
-
-Pipeline includes fallback handlers for corrupted validation rules (common in automated exports). If still failing, verify:
-- File is valid XLSX
-- Sheet name is correct
-- For company file, check BulkSell sheet exists
-
-## Advanced: Custom Matching
-
-Extend the pipeline by modifying `find_matches()` or `compute_match_score()`:
-
-```python
-def compute_match_score(company, blackbelt, match_type):
-    score = 0.0
-    # Add your custom matching logic
-    if company.serial == blackbelt.serial:
-        score += 30.0
-    return score
-```
+- Large files (10,000+ rows) may take 2-3 minutes
+- Progress bar shows real-time status
+- Results are cached for repeated access
 
 ## Data Fields Extracted
 
