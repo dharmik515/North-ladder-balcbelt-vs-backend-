@@ -87,8 +87,8 @@ async def upload_files(
     Upload Excel files and start processing.
 
       blackbelt_file — Blackbelt reference (required)
-      company_file   — Master Template, the primary inventory file (required)
-      stack_file     — Stack Bulk Upload (optional). Saved with the job for
+      company_file   — Stack Bulk Upload, the primary inventory file (required)
+      stack_file     — Master Template (optional). Saved with the job for
                        use by upcoming reference/enrichment layers; the
                        current detector run does not consume it yet.
 
@@ -173,18 +173,26 @@ async def get_results(job_id: str):
 @app.get("/api/download/{job_id}/{report_type}")
 async def download_report(job_id: str, report_type: str):
     """Download a report as a user-friendly Excel file."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
     results_dir = RESULTS_DIR / job_id
+    
+    if not results_dir.exists():
+        raise HTTPException(status_code=404, detail="Results not found")
 
     # Map report types to the Excel files written by the detector
     report_files = {
+        # Legacy severity-based downloads (kept for backward compatibility)
         "high":      ("confirmed_errors.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         "medium":    ("likely_errors.xlsx",    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         "low":       ("advisory_flags.xlsx",   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         "unmatched": ("clean_rows.xlsx",       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         "summary":   ("summary.json",          "application/json"),
+        
+        # New category-based downloads
+        "brand_mismatch":   ("category_brand_mismatch.xlsx",   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "model_mismatch":   ("category_model_mismatch.xlsx",   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "storage_mismatch": ("category_storage_mismatch.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "grade_mismatch":   ("category_grade_mismatch.xlsx",   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "not_in_blackbelt": ("category_not_in_blackbelt.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
     }
 
     # Historical filenames written by the detector — map the nice download
@@ -195,6 +203,12 @@ async def download_report(job_id: str, report_type: str):
         "advisory_flags.xlsx":   "uncertain_matches.xlsx",
         "clean_rows.xlsx":       "clean_rows.xlsx",
         "summary.json":          "summary.json",
+        # Category files use their actual names
+        "category_brand_mismatch.xlsx":   "category_brand_mismatch.xlsx",
+        "category_model_mismatch.xlsx":   "category_model_mismatch.xlsx",
+        "category_storage_mismatch.xlsx": "category_storage_mismatch.xlsx",
+        "category_grade_mismatch.xlsx":   "category_grade_mismatch.xlsx",
+        "category_not_in_blackbelt.xlsx": "category_not_in_blackbelt.xlsx",
     }
 
     if report_type not in report_files:
@@ -210,13 +224,8 @@ async def download_report(job_id: str, report_type: str):
 @app.get("/api/export/{job_id}")
 async def export_all_results(job_id: str):
     """Download ZIP of all reports."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    import zipfile
-    import io
-
     results_dir = RESULTS_DIR / job_id
+    
     if not results_dir.exists():
         raise HTTPException(status_code=404, detail="No results found")
 
@@ -242,6 +251,106 @@ async def export_all_results(job_id: str):
         content=zip_buffer.getvalue(),
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=mismatch_results_{job_id}.zip"},
+    )
+
+@app.get("/api/download_age/{job_id}/{bucket_type}/{bucket_value}")
+async def download_age_bucket(job_id: str, bucket_type: str, bucket_value: str):
+    """
+    Download detailed Excel file for a specific age bucket.
+    
+    bucket_type: 'monthly', 'quarterly', 'semi_annual', 'annual', or 'distribution'
+    bucket_value: the specific bucket (e.g., '2026-Q1', '2026-04', '0-3mo')
+    """
+    results_dir = RESULTS_DIR / job_id
+    
+    if not results_dir.exists():
+        raise HTTPException(status_code=404, detail="Results not found")
+    
+    age_file = results_dir / "product_age.xlsx"
+    
+    if not age_file.exists():
+        raise HTTPException(status_code=404, detail="Age data not found")
+    
+    import pandas as pd
+    import io
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    
+    # Load the age data
+    df = pd.read_excel(age_file, sheet_name="Product Age")
+    
+    # Filter based on bucket type
+    if bucket_type == "distribution":
+        # For distribution buckets (0-3mo, 3-6mo, etc.)
+        days_ranges = {
+            "0-3mo": (0, 90),
+            "3-6mo": (91, 180),
+            "6-12mo": (181, 365),
+            "12+mo": (366, 999999)
+        }
+        if bucket_value in days_ranges:
+            min_days, max_days = days_ranges[bucket_value]
+            filtered_df = df[(df["Days Old"] >= min_days) & (df["Days Old"] <= max_days)]
+        else:
+            raise HTTPException(status_code=400, detail="Invalid distribution bucket")
+    else:
+        # For time-based buckets (monthly, quarterly, etc.)
+        column_map = {
+            "monthly": "Monthly",
+            "quarterly": "Quarterly",
+            "semi_annual": "Semi-annual",
+            "annual": "Annual"
+        }
+        if bucket_type not in column_map:
+            raise HTTPException(status_code=400, detail="Invalid bucket type")
+        
+        column = column_map[bucket_type]
+        filtered_df = df[df[column] == bucket_value]
+    
+    if len(filtered_df) == 0:
+        raise HTTPException(status_code=404, detail="No data found for this bucket")
+    
+    # Create Excel file in memory
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        filtered_df.to_excel(writer, sheet_name='Devices', index=False)
+        
+        # Style the worksheet
+        workbook = writer.book
+        worksheet = writer.sheets['Devices']
+        
+        # Header styling
+        header_fill = PatternFill(start_color="00D4FF", end_color="00D4FF", fill_type="solid")
+        header_font = Font(bold=True, color="000000")
+        
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        
+        # Auto-adjust column widths
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+    
+    output.seek(0)
+    
+    # Generate filename
+    safe_bucket = bucket_value.replace("/", "-").replace(":", "-")
+    filename = f"product_age_{bucket_type}_{safe_bucket}_{job_id}.xlsx"
+    
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
 # ============================================================================
@@ -298,4 +407,4 @@ async def process_job(job_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

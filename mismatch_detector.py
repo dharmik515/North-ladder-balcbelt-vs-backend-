@@ -62,6 +62,18 @@ def norm_text(v) -> str:
     return re.sub(r"\s+", " ", str(v)).strip().lower()
 
 
+def clean_bb_field(v) -> str:
+    """Clean Blackbelt field values that have leading numbers and trailing special chars.
+    E.g., '1 Oppo =' -> 'oppo', '2 Samsung' -> 'samsung'
+    """
+    s = norm_text(v)
+    # Remove leading numbers (e.g., "1 ", "2 ")
+    s = re.sub(r'^\d+\s+', '', s)
+    # Remove trailing special characters (=, -, spaces)
+    s = re.sub(r'[=\-\s]+$', '', s)
+    return s.strip()
+
+
 def clean_id(v) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)) or v == "":
         return ""
@@ -114,16 +126,53 @@ def extract_storage_gb(text: str) -> Optional[int]:
 
 
 def brand_canonical(s: str) -> str:
-    s = norm_text(s)
+    s = clean_bb_field(s)
+    
+    # First, apply direct aliases
     aliases = {
-        "apple inc": "apple", "samsung electronics": "samsung",
+        "apple inc": "apple", 
+        "samsung electronics": "samsung",
         "samsung korea": "samsung",
-        "google inc": "google", "google llc": "google",
-        "xiaomi communications co ltd": "xiaomi", "xiaomi corp": "xiaomi",
+        "google inc": "google", 
+        "google llc": "google",
+        "xiaomi communications co ltd": "xiaomi", 
+        "xiaomi corp": "xiaomi",
         "microsoft surface": "microsoft",
         "macbooks": "apple",
+        "honor device company limited": "honor",
+        "huawei technologies co ltd": "huawei",
+        "vivo mobile communication co ltd": "vivo",
+        "oppo mobile telecommunications corp ltd": "oppo",
+        "oneplus technology shenzhen co ltd": "oneplus",
     }
-    return aliases.get(s, s)
+    
+    if s in aliases:
+        return aliases[s]
+    
+    # Extract core brand name by removing common corporate suffixes
+    # This handles variations like "honor device company limited" -> "honor"
+    corporate_suffixes = [
+        " device company limited",
+        " technologies co ltd",
+        " mobile communication co ltd",
+        " mobile telecommunications corp ltd",
+        " technology shenzhen co ltd",
+        " communications co ltd",
+        " electronics",
+        " corporation",
+        " corp ltd",
+        " co ltd",
+        " limited",
+        " inc",
+        " llc",
+    ]
+    
+    for suffix in corporate_suffixes:
+        if s.endswith(suffix):
+            s = s[:-len(suffix)].strip()
+            break
+    
+    return s
 
 
 # Brand fingerprints — used to detect Brand↔Label mismatch.
@@ -171,7 +220,7 @@ def load_blackbelt(path: str) -> pd.DataFrame:
         "imei2":         df["IMEI2"].map(clean_id),
         "serial":        df["Serial Number"].map(clean_id),
         "brand":         df["Manufacturer"].map(brand_canonical),
-        "model":         df["Model"].map(norm_text),
+        "model":         df["Model"].map(clean_bb_field),
         "model_number":  df["Model Number"].map(norm_text),
         "storage_gb":    df["Handset Memory Size"].map(extract_storage_gb),
         "color":         df["Device Colour"].map(norm_text),
@@ -1092,36 +1141,101 @@ def layer18_bb_reconciliation(co: pd.DataFrame, bb_records: dict) -> list[Flag]:
         if rec is None:
             continue
 
-        # Brand
-        bb_brand, m_brand = rec["brand"], r["brand"]
-        if bb_brand and m_brand and bb_brand != m_brand:
-            flags.append(mk(r, "L18", "bb_brand_mismatch", "CRITICAL", "Brand",
-                            f"Master='{m_brand}', Blackbelt='{bb_brand}'",
-                            f"'{bb_brand}' (per Blackbelt test)",
-                            f"Blackbelt physically tested this IMEI as a {bb_brand} "
-                            f"device, but Master records it as {m_brand}. Update "
-                            f"Master.Brand to '{bb_brand}'."))
+        # Brand - check if Blackbelt's manufacturer appears in Stack's asset label
+        bb_brand = brand_canonical(str(rec["brand"] or ""))
+        m_label = norm_text(str(r["asset_label"] or ""))
+        
+        if bb_brand and m_label:
+            # Check if the BB brand token appears in the asset label
+            # Use BRAND_TOKENS to get all possible brand identifiers
+            brand_found = False
+            if bb_brand in BRAND_TOKENS:
+                # Check if any of the brand's tokens appear in the label
+                label_lower = m_label.lower()
+                for token in BRAND_TOKENS[bb_brand]:
+                    if token in label_lower:
+                        brand_found = True
+                        break
+            else:
+                # For brands not in BRAND_TOKENS, just check if brand name appears
+                if bb_brand in m_label.lower():
+                    brand_found = True
+            
+            if not brand_found:
+                flags.append(mk(r, "L18", "bb_brand_mismatch", "CRITICAL", "Brand",
+                                f"Master label='{r['asset_label']}', Blackbelt brand='{bb_brand}'",
+                                f"'{bb_brand}' (per Blackbelt test)",
+                                f"Blackbelt physically tested this IMEI as a {bb_brand} "
+                                f"device, but the asset label doesn't mention {bb_brand}. "
+                                f"Update the asset label."))
 
-        # Model — check that BB's model tokens are a subset of Master's label
+        # Model — compare Stack asset label with BB model
+        # Strategy: Clean both sides heavily, then check if core model identifiers match
         bb_model, m_label = rec["model"], r["asset_label"]
         if bb_model and m_label:
-            bb_tokens = {t for t in re.split(r"[^a-z0-9]+", bb_model) if len(t) >= 3}
-            m_tokens  = set(re.split(r"[^a-z0-9]+", m_label))
-            if bb_tokens and not bb_tokens.issubset(m_tokens):
-                flags.append(mk(r, "L18", "bb_model_mismatch", "HIGH", "Model",
-                                f"Master='{m_label}', Blackbelt='{bb_model}'",
-                                f"'{bb_model}' (per Blackbelt test)",
-                                f"Blackbelt tested this IMEI as '{bb_model}', but "
-                                f"Master's label doesn't mention it. Update Master."))
+            def normalize_model(text, brand=''):
+                """Aggressively normalize model text for comparison"""
+                text = str(text).lower()
+                # Remove storage
+                text = re.sub(r'\b\d+\s*(gb|tb)\b', '', text, flags=re.IGNORECASE)
+                # Remove years
+                text = re.sub(r'\(\d{4}\)', '', text)
+                text = re.sub(r'\b20\d{2}\b', '', text)  # Also remove standalone years like 2022
+                # Remove dimensions (10.9", 11", 9.7", etc.) - these are screen sizes, not model identifiers
+                text = re.sub(r'\b\d+\.?\d*\s*["\']', '', text)
+                text = re.sub(r'\b\d+\.\d+\b', '', text)  # Remove decimal numbers like 10.9, 9.7
+                # Remove commas, hyphens, underscores, parentheses
+                text = re.sub(r'[,\-_()\']', ' ', text)
+                # Remove common non-identifying words
+                for word in ['series', 'dual', 'sim', '5g', '4g', 'lte', 'wifi', 'cellular', 
+                            'only', 'gen', 'generation', 'the', 'phone']:
+                    text = re.sub(r'\b' + word + r'\b', '', text, flags=re.IGNORECASE)
+                # Normalize "plus" to "+"
+                text = re.sub(r'\bplus\b', '+', text)
+                # Normalize ordinals: 2nd->2, 3rd->3, 4th->4, 10th->10, etc.
+                text = re.sub(r'(\d+)(st|nd|rd|th)\b', r'\1', text)
+                # Remove brand (may appear multiple times)
+                if brand:
+                    text = re.sub(r'\b' + re.escape(brand.lower()) + r'\b', '', text)
+                # Remove all spaces
+                text = re.sub(r'\s+', '', text)
+                return text
+            
+            bb_brand_normalized = brand_canonical(str(rec["brand"] or ""))
+            m_normalized = normalize_model(m_label, bb_brand_normalized)
+            bb_normalized = normalize_model(bb_model, bb_brand_normalized)
+            
+            # Check if one contains the other OR if they share significant overlap
+            if bb_normalized and m_normalized:
+                # Direct containment check
+                if bb_normalized in m_normalized or m_normalized in bb_normalized:
+                    # Match - don't flag
+                    pass
+                else:
+                    # Check character-level similarity for close matches
+                    # Calculate how many characters from BB are in Stack (in order)
+                    common_chars = sum(1 for c in bb_normalized if c in m_normalized)
+                    similarity = common_chars / len(bb_normalized) if bb_normalized else 0
+                    
+                    if similarity < 0.7:  # Less than 70% of BB chars found in Stack
+                        flags.append(mk(r, "L18", "bb_model_mismatch", "HIGH", "Model",
+                                        f"Stack='{m_label}', Blackbelt='{bb_model}'",
+                                        f"'{bb_model}' (per Blackbelt test)",
+                                        f"Blackbelt tested this IMEI as '{bb_model}', but "
+                                        f"Stack's label shows '{m_label}'. Verify model."))
 
-        # Storage
-        bb_st, m_st = rec["storage_gb"], r["storage_gb"]
-        if bb_st and m_st and int(bb_st) != int(m_st):
+        # Storage — extract from asset label and compare with BB's handset memory
+        bb_st = rec["storage_gb"]
+        # Extract storage from asset label
+        m_label_text = str(r["asset_label"] or "")
+        m_st_from_label = extract_storage_gb(m_label_text)
+        
+        if bb_st and m_st_from_label and int(bb_st) != int(m_st_from_label):
             flags.append(mk(r, "L18", "bb_storage_mismatch", "HIGH", "Storage",
-                            f"Master={int(m_st)}GB, Blackbelt={int(bb_st)}GB",
+                            f"Master={int(m_st_from_label)}GB, Blackbelt={int(bb_st)}GB",
                             f"{int(bb_st)}GB (per Blackbelt test)",
                             f"Blackbelt's hardware read confirms {int(bb_st)}GB, but "
-                            f"Master records {int(m_st)}GB. Affects price; correct Master."))
+                            f"Master's asset label shows {int(m_st_from_label)}GB. Update Master."))
 
         # Grade
         bb_g, m_g = _grade_normalize(rec["grade"]), _grade_normalize(r["grade"])
@@ -1555,6 +1669,16 @@ ADVISORY_ISSUES: set[str] = {
     "stale_inventory",               # L20 — operational, not a data error
 }
 
+# Priority issues — ONLY these 5 categories are flagged and shown in the UI.
+# All other issues are excluded from flagging and treated as clean rows.
+PRIORITY_ISSUES: set[str] = {
+    "bb_brand_mismatch",    # Brand mismatch with Blackbelt
+    "bb_model_mismatch",    # Model mismatch with Blackbelt
+    "bb_storage_mismatch",  # Storage mismatch with Blackbelt
+    "bb_grade_mismatch",    # Grade mismatch with Blackbelt
+    "not_in_blackbelt",     # Device not found in Blackbelt
+}
+
 # Per-layer metadata for the 'How to Read This Report' guide sheet.
 # These names show up in the legend so users can match a problem back to the
 # kind of check that produced it. Keep them short and plain-English; the
@@ -1767,9 +1891,8 @@ _PRIORITY_ORDER = {label: idx for idx, (label, _) in enumerate(PRIORITY_EXPLAIN)
 # columns Row #, Priority, Check Type, How to Fix were intentionally removed
 # at the manager's request.
 _FLAGGED_COLUMNS = [
-    "Deal ID", "IMEI", "Blackbelt", "Stack Bulk", "Location",
+    "Deal ID", "IMEI", "Stack Device", "Blackbelt Device", "Location",
     "Stack ID", "VAT Type",
-    "Problem", "Field", "Current Value",
 ]
 
 _CLEAN_COLUMNS = [
@@ -1781,29 +1904,60 @@ _CLEAN_COLUMNS = [
 
 def _friendly_flagged(df: pd.DataFrame,
                       bb_by_imei: dict | None = None,
-                      stack_by_imei: dict | None = None) -> pd.DataFrame:
+                      stack_by_imei: dict | None = None,
+                      bb_records: dict | None = None) -> pd.DataFrame:
     if not len(df):
         return pd.DataFrame(columns=_FLAGGED_COLUMNS)
 
     bb_by_imei    = bb_by_imei    or {}
     stack_by_imei = stack_by_imei or {}
-    issue_info = lambda i, k: ISSUE_INFO.get(i, {}).get(k, "")
+    bb_records    = bb_records    or {}
 
     imei_series = df["imei"].astype(str)
+    
+    # Build Stack Device and Blackbelt Device columns
+    stack_device_col = []
+    bb_device_col = []
+    
+    for idx, row in df.iterrows():
+        imei = str(row["imei"])
+        issue = row.get("issue", "")
+        bb_rec = bb_records.get(imei, {})
+        
+        # For model mismatch: show model only (extract from asset label by removing storage)
+        if issue == "bb_model_mismatch":
+            asset_label = str(row.get("asset_label", ""))
+            # Remove storage to get just the model
+            model_only = re.sub(r'\b\d+\s*(gb|tb)\b', '', asset_label, flags=re.IGNORECASE).strip()
+            model_only = re.sub(r'\s+', ' ', model_only)
+            stack_device_col.append(model_only)
+            bb_device_col.append(str(bb_rec.get("model", "")))
+        # For storage mismatch: show storage only
+        elif issue == "bb_storage_mismatch":
+            stack_storage = extract_storage_gb(str(row.get("asset_label", "")))
+            bb_storage = bb_rec.get("storage_gb", "")
+            stack_device_col.append(f"{stack_storage}GB" if stack_storage else "")
+            bb_device_col.append(f"{bb_storage}GB" if bb_storage else "")
+        # For grade mismatch: show grade only
+        elif issue == "bb_grade_mismatch":
+            stack_device_col.append(str(row.get("grade", "")))
+            bb_device_col.append(str(bb_rec.get("grade", "")))
+        # For all other issues: show full asset label
+        else:
+            stack_device_col.append(stack_by_imei.get(imei, ""))
+            bb_device_col.append(bb_by_imei.get(imei, ""))
+    
     out = pd.DataFrame({
         "Deal ID":           df["appraisal"].astype(str),
         "IMEI":              imei_series,
-        "Blackbelt":         imei_series.map(lambda x: bb_by_imei.get(x, "")),
-        "Stack Bulk":        imei_series.map(lambda x: stack_by_imei.get(x, "")),
+        "Stack Device":      stack_device_col,
+        "Blackbelt Device":  bb_device_col,
         "Location":          df.get("location_text", pd.Series([""] * len(df))).astype(str),
         "Stack ID":          df.get("stack_id",  pd.Series([""] * len(df))).astype(str),
         "VAT Type":          df.get("vat_type",  pd.Series([""] * len(df))).astype(str),
-        "Problem":           df["issue"].map(lambda i: issue_info(i, "problem") or i),
-        "Field":             df["field"].astype(str),
-        "Current Value":     df["current_value"].astype(str),
     })
-    # Sort by severity (CRITICAL first) then row index, so the most important
-    # rows are at the top — but those columns are not exported.
+    
+    # Sort by severity (CRITICAL first) then row index
     sev_rank = df["severity"].map(SEVERITY_RANK).fillna(99).astype(int).values
     row_idx  = pd.to_numeric(df["co_row"], errors="coerce").fillna(0).astype(int).values
     out = out.assign(_s=sev_rank, _r=row_idx)
@@ -2042,10 +2196,11 @@ def _write_legend_sheet(ws, is_flagged: bool) -> None:
 
 def _write_excel_report(rows: list | pd.DataFrame, out_path: Path, is_flagged: bool,
                         bb_by_imei: dict | None = None,
-                        stack_by_imei: dict | None = None) -> None:
+                        stack_by_imei: dict | None = None,
+                        bb_records: dict | None = None) -> None:
     df = pd.DataFrame(rows) if not isinstance(rows, pd.DataFrame) else rows
     if is_flagged:
-        friendly = _friendly_flagged(df, bb_by_imei, stack_by_imei)
+        friendly = _friendly_flagged(df, bb_by_imei, stack_by_imei, bb_records)
     else:
         friendly = _friendly_clean(df, bb_by_imei, stack_by_imei)
     sheet_name = "Flagged Rows" if is_flagged else "Clean Rows"
@@ -2248,7 +2403,7 @@ def _build_bb_records(bb_path: str) -> dict:
     for _, r in bb_raw.iterrows():
         rec = {
             "brand":        brand_canonical(r.get("Manufacturer", "")),
-            "model":        norm_text(r.get("Model", "")),
+            "model":        clean_bb_field(r.get("Model", "")),
             "model_number": norm_text(r.get("Model Number", "")),
             "storage_gb":   extract_storage_gb(r.get("Handset Memory Size", "")),
             "color":        norm_text(r.get("Device Colour", "")),
@@ -2426,15 +2581,14 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     flags_df = pd.DataFrame([asdict(f) for f in flags])
     flags_df.to_csv(out_dir / "flagged.csv", index=False)
 
-    # Per-row worst flag — advisory-only issues are excluded from severity
-    # bucketing so a row whose only flags are coverage/catalog gaps falls
-    # through to the clean bucket. They remain in flags_df / by_issue counts
-    # so the recommendations sheet still surfaces them.
-    real_flags_df = (flags_df[~flags_df["issue"].isin(ADVISORY_ISSUES)]
-                     if len(flags_df) else flags_df)
+    # Per-row worst flag — only PRIORITY issues are considered for flagging.
+    # All other issues are excluded so devices are only flagged for the 5
+    # priority categories: brand, model, storage, grade, not_in_blackbelt.
+    priority_flags_df = (flags_df[flags_df["issue"].isin(PRIORITY_ISSUES)]
+                         if len(flags_df) else flags_df)
     worst_df = pd.DataFrame()
-    if len(real_flags_df):
-        worst_df = (real_flags_df.assign(_rank=real_flags_df["severity"].map(SEVERITY_RANK))
+    if len(priority_flags_df):
+        worst_df = (priority_flags_df.assign(_rank=priority_flags_df["severity"].map(SEVERITY_RANK))
                               .sort_values("_rank")
                               .groupby("co_row", as_index=False)
                               .first()
@@ -2470,7 +2624,7 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     medium_rows = by_sev["MEDIUM"]
     low_rows    = by_sev["LOW"]
     flagged_co_rows = set(int(f.co_row) for f in flags
-                          if f.issue not in ADVISORY_ISSUES)
+                          if f.issue in PRIORITY_ISSUES)
     clean_rows = [
         {"co_row": int(r["co_row"]), "asset_id": str(r["asset_id"]),
          "appraisal": str(r["appraisal"]),
@@ -2484,7 +2638,18 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
 
     # bb_by_imei + stack_by_imei_label are built earlier (used by L17/L19).
     # Reused here for the report's Blackbelt and Stack Bulk cross-ref columns.
-    stack_by_imei = stack_by_imei_label
+    # Build stack_by_imei from the actual company data (co), not from stack_path
+    # since co IS the Stack Bulk data in the current setup.
+    stack_by_imei_from_co = {}
+    for _, r in co.iterrows():
+        imei = str(r.get("imei", "") or "").strip()
+        if imei:
+            label = str(r.get("asset_label", "") or "").strip()
+            if label and imei not in stack_by_imei_from_co:
+                stack_by_imei_from_co[imei] = label
+    
+    # Use the co-based lookup for the report (this is the actual Stack Bulk data)
+    stack_by_imei = stack_by_imei_from_co
     print(f"Cross-ref: {len(bb_by_imei)} BB IMEI keys, {len(stack_by_imei)} Stack Bulk IMEIs")
 
     # Write the four CSVs the UI download endpoints look for
@@ -2497,11 +2662,11 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     # column names, priority/check-type/problem dictionaries, a legend
     # sheet, and long IMEIs stored as text (no scientific notation).
     _write_excel_report(high_rows,   out_dir / XLSX_FILE_HIGH,      is_flagged=True,
-                        bb_by_imei=bb_by_imei, stack_by_imei=stack_by_imei)
+                        bb_by_imei=bb_by_imei, stack_by_imei=stack_by_imei, bb_records=bb_records)
     _write_excel_report(medium_rows, out_dir / XLSX_FILE_MEDIUM,    is_flagged=True,
-                        bb_by_imei=bb_by_imei, stack_by_imei=stack_by_imei)
+                        bb_by_imei=bb_by_imei, stack_by_imei=stack_by_imei, bb_records=bb_records)
     _write_excel_report(low_rows,    out_dir / XLSX_FILE_LOW,       is_flagged=True,
-                        bb_by_imei=bb_by_imei, stack_by_imei=stack_by_imei)
+                        bb_by_imei=bb_by_imei, stack_by_imei=stack_by_imei, bb_records=bb_records)
     _write_excel_report(clean_rows,  out_dir / XLSX_FILE_UNMATCHED, is_flagged=False,
                         bb_by_imei=bb_by_imei, stack_by_imei=stack_by_imei)
 
@@ -2525,7 +2690,7 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
     flags_full = pd.DataFrame()
     if len(flags_df):
         co_ctx = co[["co_row", "imei", "location_text", "brand", "asset_label",
-                     "category", "stack_id", "vat_type"]].copy()
+                     "category", "stack_id", "vat_type", "grade"]].copy()
         co_ctx["co_row"] = co_ctx["co_row"].astype(int)
         flags_full = flags_df.copy()
         flags_full["co_row"] = flags_full["co_row"].astype(int)
@@ -2537,7 +2702,8 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
                                 by_issue_dir / fname,
                                 is_flagged=True,
                                 bb_by_imei=bb_by_imei,
-                                stack_by_imei=stack_by_imei)
+                                stack_by_imei=stack_by_imei,
+                                bb_records=bb_records)
             by_issue_files[str(issue_code)] = fname
 
     # ------------------------------------------------------------------
@@ -2572,8 +2738,22 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
                             out_dir / meta["file"],
                             is_flagged=True,
                             bb_by_imei=bb_by_imei,
-                            stack_by_imei=stack_by_imei)
+                            stack_by_imei=stack_by_imei,
+                            bb_records=bb_records)
         category_files[key] = meta["file"]
+
+    # ------------------------------------------------------------------
+    # MODEL DIFFERENCE BREAKDOWN — show actual counts from Excel files
+    # These are the total counts, not mutually exclusive
+    # 1. Brand mismatch - total from brand_mismatch Excel
+    # 2. Model mismatch - total from model_mismatch Excel
+    # 3. Storage mismatch - total from storage_mismatch Excel
+    # ------------------------------------------------------------------
+    model_diff_breakdown = {
+        "brand_only": category_counts.get("brand_mismatch", 0),
+        "model_only": category_counts.get("model_mismatch", 0),
+        "storage_only": category_counts.get("storage_mismatch", 0),
+    }
 
     # ------------------------------------------------------------------
     # PRODUCT AGE — bucket every backend row by trade-in date for the UI.
@@ -2622,12 +2802,27 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
         s = age_df[col].value_counts().reset_index()
         s.columns = ["bucket", "count"]
         return s.sort_values("bucket").to_dict(orient="records")
+    
+    # Age distribution buckets (0-3mo, 3-6mo, 6-12mo, 12+mo)
+    age_distribution = {"0-3mo": 0, "3-6mo": 0, "6-12mo": 0, "12+mo": 0}
+    if len(age_df):
+        for days in age_df["Days Old"]:
+            if days <= 90:
+                age_distribution["0-3mo"] += 1
+            elif days <= 180:
+                age_distribution["3-6mo"] += 1
+            elif days <= 365:
+                age_distribution["6-12mo"] += 1
+            else:
+                age_distribution["12+mo"] += 1
+    
     product_age_summary = {
         "total_with_date": int(len(age_df)),
         "monthly":         _counts("Monthly"),
         "quarterly":       _counts("Quarterly"),
         "semi_annual":     _counts("Semi-annual"),
         "annual":          _counts("Annual"),
+        "distribution":    age_distribution,
         "file":            age_file,
     }
 
@@ -2693,11 +2888,19 @@ def run(bb_path: str = BB_PATH, co_path: str = CO_PATH, out_dir: Path = OUT_DIR,
                                  "file":  category_files["not_in_blackbelt"]},
         },
 
-        # Wrong Model comparison — Stack-tagged rows already known by the team
-        # vs the model-mismatch rows our detector found independently.
+        # Model difference breakdown — mutually exclusive categories
+        "model_difference_breakdown": model_diff_breakdown,
+
+        # Priority issues comparison — Only the 5 priority categories
+        # Total of brand + model + storage + grade + not_in_blackbelt
+        # vs how many were already flagged as "Wrong Model" in Stack
         "wrong_model_comparison": {
-            "stack_tagged_count":    int(wrong_model_stack_count),
-            "model_flagged_count":   int(category_counts["model_mismatch"]),
+            "total_mismatches":          int(category_counts.get("brand_mismatch", 0) + 
+                                            category_counts.get("model_mismatch", 0) + 
+                                            category_counts.get("storage_mismatch", 0) +
+                                            category_counts.get("grade_mismatch", 0) +
+                                            category_counts.get("not_in_blackbelt", 0)),
+            "already_flagged_in_stack":  int(wrong_model_stack_count),
         },
 
         # Product age buckets for the dashboard granularity selector.

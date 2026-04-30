@@ -106,6 +106,7 @@ function _markSelected(slot, file, labelEl, checkEl, prefix) {
     checkEl.textContent = '✓';
     checkEl.style.color = '#51cf66';
     fileStatus.style.display = 'flex';
+    console.log('File selected:', slot, 'uploadedFiles:', uploadedFiles);
     updateUploadButton();
 }
 
@@ -144,26 +145,30 @@ function handleDroppedFiles(files) {
             const dt = new DataTransfer(); dt.items.add(file);
             blackbeltInput.files = dt.files;
             handleBlackbeltSelect({ target: { files: dt.files } });
-        } else if (!uploadedFiles.master && (n.includes('Master') || n.includes('StockTake'))) {
-            const dt = new DataTransfer(); dt.items.add(file);
-            masterInput.files = dt.files;
-            handleMasterSelect({ target: { files: dt.files } });
         } else if (!uploadedFiles.stack && (n.includes('Stack') || n.includes('Upload') || n.includes('BulkSell'))) {
             const dt = new DataTransfer(); dt.items.add(file);
             stackInput.files = dt.files;
             handleStackSelect({ target: { files: dt.files } });
+        } else if (!uploadedFiles.master && (n.includes('Master') || n.includes('StockTake'))) {
+            const dt = new DataTransfer(); dt.items.add(file);
+            masterInput.files = dt.files;
+            handleMasterSelect({ target: { files: dt.files } });
         }
     }
 }
 
 function updateUploadButton() {
-    // Required: Blackbelt + Master Template. Stack Bulk is optional.
-    if (uploadedFiles.blackbelt && uploadedFiles.master) {
+    // Required: Blackbelt + Stack Bulk. Master Template is optional.
+    console.log('updateUploadButton called. uploadedFiles:', uploadedFiles);
+    console.log('blackbelt:', uploadedFiles.blackbelt, 'stack:', uploadedFiles.stack);
+    if (uploadedFiles.blackbelt && uploadedFiles.stack) {
         uploadBtn.disabled = false;
         uploadBtn.style.cursor = 'pointer';
+        console.log('Button enabled!');
     } else {
         uploadBtn.disabled = true;
         uploadBtn.style.cursor = 'not-allowed';
+        console.log('Button disabled - missing required files');
     }
 }
 
@@ -172,17 +177,17 @@ function updateUploadButton() {
 // ============================================================================
 
 async function handleUpload() {
-    if (!uploadedFiles.blackbelt || !uploadedFiles.master) {
-        alert('Please select the Blackbelt file and Master Template (Stack Bulk is optional)');
+    if (!uploadedFiles.blackbelt || !uploadedFiles.stack) {
+        alert('Please select the Blackbelt file and Stack Bulk Upload (Master Template is optional)');
         return;
     }
 
     const formData = new FormData();
     formData.append('blackbelt_file', blackbeltInput.files[0]);
-    // Master Template is the primary "company" input for the detector.
-    formData.append('company_file',   masterInput.files[0]);
-    if (uploadedFiles.stack && stackInput.files[0]) {
-        formData.append('stack_file', stackInput.files[0]);
+    // Stack Bulk is the primary "company" input for the detector.
+    formData.append('company_file',   stackInput.files[0]);
+    if (uploadedFiles.master && masterInput.files[0]) {
+        formData.append('stack_file', masterInput.files[0]);
     }
     
     try {
@@ -287,18 +292,26 @@ function showResults(results) {
     document.getElementById('timestamp').textContent = 
         `Processed on ${date.toLocaleDateString()} at ${date.toLocaleTimeString()}`;
     
-    // Update cards
+    // Update summary cards
     const matches = results.matches;
-    document.getElementById('highCount').textContent = matches.high_confidence.count;
-    document.getElementById('mediumCount').textContent = matches.medium_confidence.count;
-    document.getElementById('lowCount').textContent = matches.low_confidence.count;
+    document.getElementById('totalCount').textContent = results.total_processed;
     document.getElementById('unmatchedCount').textContent = matches.unmatched.count;
     
-    // Update recommendations
-    displayRecommendations(results.recommendations);
+    // Update model difference breakdown
+    const modelDiff = results.model_difference_breakdown || {brand_only: 0, model_only: 0, storage_only: 0};
+    document.getElementById('brandOnlyCount').textContent = modelDiff.brand_only;
+    document.getElementById('modelOnlyCount').textContent = modelDiff.model_only;
+    document.getElementById('storageOnlyCount').textContent = modelDiff.storage_only;
     
-    // Create charts
-    createCharts(matches);
+    // Update additional metrics
+    document.getElementById('gradeMismatchCount').textContent = results.categories.grade_mismatch.count;
+    document.getElementById('notInBlackbeltCount').textContent = results.categories.not_in_blackbelt.count;
+    
+    // Create charts (Stack comparison and Age distribution only)
+    createCharts(matches, results);
+    
+    // Setup age bucket selector
+    setupAgeBucketSelector(results.product_age);
     
     // Update action buttons
     setupDownloadButtons();
@@ -346,81 +359,81 @@ function displayRecommendations(recommendations) {
     });
 }
 
-function createCharts(matches) {
-    // Distribution Chart
-    const distCtx = document.getElementById('distributionChart').getContext('2d');
-    new Chart(distCtx, {
-        type: 'doughnut',
-        data: {
-            labels: ['Confirmed Errors', 'Likely Errors', 'Advisory Flags', 'Clean Rows'],
-            datasets: [{
-                data: [
-                    matches.high_confidence.count,
-                    matches.medium_confidence.count,
-                    matches.low_confidence.count,
-                    matches.unmatched.count,
-                ],
-                backgroundColor: [
-                    '#ff6b6b',
-                    '#ff922b',
-                    '#ffd43b',
-                    '#51cf66',
-                ],
-                borderColor: '#050812',
-                borderWidth: 2,
-            }],
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: true,
-            plugins: {
-                legend: {
-                    position: 'bottom',
-                    labels: {
-                        color: '#e0e0e0',
-                        padding: 15,
-                    },
-                },
-            },
-        },
-    });
-    
-    // Confidence Breakdown
-    const total = matches.high_confidence.count + matches.medium_confidence.count + 
-                  matches.low_confidence.count + matches.unmatched.count;
-    
-    const confCtx = document.getElementById('confidenceChart').getContext('2d');
-    new Chart(confCtx, {
+function createCharts(matches, results) {
+    // Stack vs Model Comparison Chart - showing all flagged devices
+    const wrongModel = results.wrong_model_comparison || {total_mismatches: 0, already_flagged_in_stack: 0};
+    const stackCtx = document.getElementById('stackComparisonChart').getContext('2d');
+    new Chart(stackCtx, {
         type: 'bar',
         data: {
-            labels: ['Confirmed', 'Likely', 'Advisory', 'Clean'],
+            labels: ['Total Flagged Devices', 'Already Flagged in Stack'],
             datasets: [{
-                label: 'Rows',
-                data: [
-                    matches.high_confidence.count,
-                    matches.medium_confidence.count,
-                    matches.low_confidence.count,
-                    matches.unmatched.count,
-                ],
-                backgroundColor: [
-                    '#ff6b6b',
-                    '#ff922b',
-                    '#ffd43b',
-                    '#51cf66',
-                ],
+                label: 'Device Count',
+                data: [wrongModel.total_mismatches, wrongModel.already_flagged_in_stack],
+                backgroundColor: ['#ff922b', '#00d4ff'],
                 borderRadius: 8,
             }],
         },
         options: {
-            indexAxis: 'y',
             responsive: true,
             maintainAspectRatio: true,
             scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: { color: '#e0e0e0' },
+                    grid: { color: '#1a1a2e' },
+                },
                 x: {
                     ticks: { color: '#e0e0e0' },
                     grid: { color: '#1a1a2e' },
                 },
+            },
+            plugins: {
+                legend: {
+                    display: false,
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return context.parsed.y + ' devices';
+                        }
+                    }
+                }
+            },
+        },
+    });
+    
+    // Age Distribution Chart (Line Chart)
+    const ageDist = results.product_age?.distribution || {'0-3mo': 0, '3-6mo': 0, '6-12mo': 0, '12+mo': 0};
+    const ageCtx = document.getElementById('ageDistributionChart').getContext('2d');
+    new Chart(ageCtx, {
+        type: 'line',
+        data: {
+            labels: ['0-3 months', '3-6 months', '6-12 months', '12+ months'],
+            datasets: [{
+                label: 'Number of Devices',
+                data: [ageDist['0-3mo'], ageDist['3-6mo'], ageDist['6-12mo'], ageDist['12+mo']],
+                borderColor: '#00d4ff',
+                backgroundColor: 'rgba(0, 212, 255, 0.1)',
+                fill: true,
+                tension: 0.4,
+                pointRadius: 6,
+                pointHoverRadius: 8,
+                pointBackgroundColor: '#00d4ff',
+                pointBorderColor: '#fff',
+                pointBorderWidth: 2,
+            }],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            scales: {
                 y: {
+                    beginAtZero: true,
+                    ticks: { color: '#e0e0e0' },
+                    grid: { color: '#1a1a2e' },
+                },
+                x: {
                     ticks: { color: '#e0e0e0' },
                     grid: { color: '#1a1a2e' },
                 },
@@ -435,21 +448,25 @@ function createCharts(matches) {
 }
 
 function setupDownloadButtons() {
-    document.getElementById('downloadHighBtn').onclick = (e) => {
+    document.getElementById('downloadBrandBtn').onclick = (e) => {
         e.preventDefault();
-        downloadReport('high');
+        downloadCategoryReport('brand_mismatch');
     };
-    document.getElementById('downloadMediumBtn').onclick = (e) => {
+    document.getElementById('downloadModelBtn').onclick = (e) => {
         e.preventDefault();
-        downloadReport('medium');
+        downloadCategoryReport('model_mismatch');
     };
-    document.getElementById('downloadLowBtn').onclick = (e) => {
+    document.getElementById('downloadStorageBtn').onclick = (e) => {
         e.preventDefault();
-        downloadReport('low');
+        downloadCategoryReport('storage_mismatch');
     };
-    document.getElementById('downloadUnmatchedBtn').onclick = (e) => {
+    document.getElementById('downloadGradeBtn').onclick = (e) => {
         e.preventDefault();
-        downloadReport('unmatched');
+        downloadCategoryReport('grade_mismatch');
+    };
+    document.getElementById('downloadNotInBlackbeltBtn').onclick = (e) => {
+        e.preventDefault();
+        downloadCategoryReport('not_in_blackbelt');
     };
     document.getElementById('downloadAllBtn').onclick = (e) => {
         e.preventDefault();
@@ -457,10 +474,10 @@ function setupDownloadButtons() {
     };
 }
 
-function downloadReport(type) {
+function downloadCategoryReport(category) {
     const link = document.createElement('a');
-    link.href = `/api/download/${currentJobId}/${type}`;
-    link.download = `mismatch_${type}_${currentJobId}.csv`;
+    link.href = `/api/download/${currentJobId}/${category}`;
+    link.download = `${category}_${currentJobId}.xlsx`;
     link.click();
 }
 
@@ -469,6 +486,69 @@ function downloadAllReports() {
     link.href = `/api/export/${currentJobId}`;
     link.download = `mismatch_results_${currentJobId}.zip`;
     link.click();
+}
+
+function setupAgeBucketSelector(productAge) {
+    if (!productAge) return;
+    
+    const bucketTypeSelect = document.getElementById('bucketTypeSelect');
+    const bucketValueSelect = document.getElementById('bucketValueSelect');
+    const downloadBtn = document.getElementById('downloadAgeBucketBtn');
+    
+    // Store the product age data globally for access
+    window.productAgeData = productAge;
+    
+    // Update bucket values when type changes
+    bucketTypeSelect.addEventListener('change', function() {
+        const type = this.value;
+        bucketValueSelect.innerHTML = '<option value="">Select period...</option>';
+        
+        let buckets = [];
+        if (type === 'monthly') {
+            buckets = productAge.monthly || [];
+        } else if (type === 'quarterly') {
+            buckets = productAge.quarterly || [];
+        } else if (type === 'semi_annual') {
+            buckets = productAge.semi_annual || [];
+        } else if (type === 'annual') {
+            buckets = productAge.annual || [];
+        }
+        
+        // Sort buckets in reverse chronological order (newest first)
+        buckets.sort((a, b) => b.bucket.localeCompare(a.bucket));
+        
+        buckets.forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.bucket;
+            option.textContent = `${item.bucket} (${item.count} devices)`;
+            bucketValueSelect.appendChild(option);
+        });
+        
+        downloadBtn.disabled = true;
+    });
+    
+    // Enable download button when value is selected
+    bucketValueSelect.addEventListener('change', function() {
+        downloadBtn.disabled = !this.value;
+    });
+    
+    // Handle download
+    downloadBtn.addEventListener('click', function() {
+        const bucketType = bucketTypeSelect.value;
+        const bucketValue = bucketValueSelect.value;
+        
+        if (!bucketValue) {
+            alert('Please select a time period');
+            return;
+        }
+        
+        const link = document.createElement('a');
+        link.href = `/api/download_age/${currentJobId}/${bucketType}/${encodeURIComponent(bucketValue)}`;
+        link.click();
+    });
+    
+    // Trigger initial load
+    bucketTypeSelect.dispatchEvent(new Event('change'));
 }
 
 function updateInsights(results) {
@@ -511,14 +591,14 @@ function resetUI() {
     masterInput.value    = '';
     stackInput.value     = '';
     document.getElementById('blackbeltName').textContent = 'Blackbelt: Not selected';
-    document.getElementById('masterName').textContent    = 'Master Template: Not selected';
-    document.getElementById('stackName').textContent     = 'Stack Bulk: Not selected (optional)';
+    document.getElementById('stackName').textContent     = 'Stack Bulk: Not selected';
+    document.getElementById('masterName').textContent    = 'Master Template: Not selected (optional)';
     document.getElementById('blackbeltCheck').textContent = '○';
-    document.getElementById('masterCheck').textContent    = '○';
     document.getElementById('stackCheck').textContent     = '○';
+    document.getElementById('masterCheck').textContent    = '○';
     document.getElementById('blackbeltCheck').style.color = '';
-    document.getElementById('masterCheck').style.color    = '';
     document.getElementById('stackCheck').style.color     = '';
+    document.getElementById('masterCheck').style.color    = '';
     fileStatus.style.display = 'none';
     uploadBtn.disabled = true;
 
